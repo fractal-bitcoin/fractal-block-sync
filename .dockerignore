@@ -1,0 +1,16 @@
+.git
+
+.gocache
+.gomodcache
+.cache
+tmp
+dist
+build
+
+*.test
+coverage.out
+fractal-block-sync
+
+.env
+.env.*
+*.log

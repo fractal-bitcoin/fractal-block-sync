@@ -1,0 +1,95 @@
+name: fractal-block-sync
+
+x-fractal-block-sync-common: &fractal-block-sync-common
+  image: ${FRACTAL_BLOCK_SYNC_IMAGE:-fractal-block-sync:local}
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      TARGETOS: ${TARGETOS:-linux}
+      TARGETARCH: ${TARGETARCH:-amd64}
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - type: bind
+      source: ${BITCOIN_COOKIE_FILE:-/dev/null}
+      target: /data/.bitcoin/.cookie
+      read_only: true
+  logging:
+    driver: json-file
+    options:
+      max-size: ${LOG_MAX_SIZE:-100m}
+      max-file: ${LOG_MAX_FILE:-3}
+
+services:
+  fractal-block-sync-upload:
+    <<: *fractal-block-sync-common
+    profiles:
+      - upload
+    restart: unless-stopped
+    environment:
+      ENDPOINT_URL: ${ENDPOINT_URL:-}
+      ACCESS_KEY_ID: ${ACCESS_KEY_ID:-}
+      SECRET_ACCESS_KEY: ${SECRET_ACCESS_KEY:-}
+      BUCKET_NAME: ${BUCKET_NAME:-}
+      RPC_URL: ${RPC_URL:-http://host.docker.internal:8332}
+      RPC_USER: ${RPC_USER:-}
+      RPC_PASSWORD: ${RPC_PASSWORD:-}
+      BITCOIN_COOKIE_FILE: ${BITCOIN_COOKIE_FILE:-}
+      FROM_HEIGHT: ${FROM_HEIGHT:-0}
+      RANGE_SIZE: ${RANGE_SIZE:-2880}
+      STABLE_DELAY: ${STABLE_DELAY:-2880}
+      UPLOAD_INTERVAL: ${UPLOAD_INTERVAL:-30s}
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        set -- upload \
+          --rpc-url "$${RPC_URL}" \
+          --from-height "$${FROM_HEIGHT}" \
+          --range-size "$${RANGE_SIZE}" \
+          --stable-delay "$${STABLE_DELAY}" \
+          --interval "$${UPLOAD_INTERVAL}" \
+          --follow
+        if [ -n "$${BITCOIN_COOKIE_FILE:-}" ]; then
+          set -- "$$@" --cookie-file /data/.bitcoin/.cookie
+        fi
+        if [ -n "$${RPC_USER:-}" ] || [ -n "$${RPC_PASSWORD:-}" ]; then
+          set -- "$$@" --rpc-user "$${RPC_USER:-}" --rpc-password "$${RPC_PASSWORD:-}"
+        fi
+        exec fractal-block-sync "$$@"
+
+  fractal-block-sync-submit:
+    <<: *fractal-block-sync-common
+    profiles:
+      - submit
+    restart: unless-stopped
+    environment:
+      BASE_URL: ${BASE_URL:-}
+      RPC_URL: ${RPC_URL:-http://host.docker.internal:8332}
+      RPC_USER: ${RPC_USER:-}
+      RPC_PASSWORD: ${RPC_PASSWORD:-}
+      BITCOIN_COOKIE_FILE: ${BITCOIN_COOKIE_FILE:-}
+      RANGE_SIZE: ${RANGE_SIZE:-2880}
+      RECENT_WALK_LIMIT: ${RECENT_WALK_LIMIT:-2880}
+      SUBMIT_INTERVAL: ${SUBMIT_INTERVAL:-10s}
+    entrypoint:
+      - /bin/sh
+      - -ec
+    command:
+      - |
+        set -- submit \
+          --base-url "$${BASE_URL}" \
+          --rpc-url "$${RPC_URL}" \
+          --range-size "$${RANGE_SIZE}" \
+          --recent-walk-limit "$${RECENT_WALK_LIMIT}" \
+          --interval "$${SUBMIT_INTERVAL}" \
+          --follow
+        if [ -n "$${BITCOIN_COOKIE_FILE:-}" ]; then
+          set -- "$$@" --cookie-file /data/.bitcoin/.cookie
+        fi
+        if [ -n "$${RPC_USER:-}" ] || [ -n "$${RPC_PASSWORD:-}" ]; then
+          set -- "$$@" --rpc-user "$${RPC_USER:-}" --rpc-password "$${RPC_PASSWORD:-}"
+        fi
+        exec fractal-block-sync "$$@"

@@ -1,0 +1,166 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"time"
+
+	blocksync "fractal-block-sync"
+	"fractal-block-sync/btcrpc"
+	"fractal-block-sync/r2store"
+)
+
+const defaultRPCURL = "http://127.0.0.1:8332"
+
+func main() {
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
+
+func run(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: fractal-block-sync <upload|submit> [flags]")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
+
+	switch args[0] {
+	case "upload":
+		return runUpload(ctx, args[1:])
+	case "submit":
+		return runSubmit(ctx, args[1:])
+	case "-h", "--help", "help":
+		printUsage()
+		return nil
+	default:
+		return fmt.Errorf("unknown command %q", args[0])
+	}
+}
+
+func runUpload(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("upload", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	rpcURL := flags.String("rpc-url", defaultRPCURL, "bitcoind RPC URL")
+	cookieFile := flags.String("cookie-file", "", "bitcoind cookie file")
+	rpcUser := flags.String("rpc-user", "", "bitcoind RPC username")
+	rpcPassword := flags.String("rpc-password", "", "bitcoind RPC password")
+	fromHeight := flags.Uint64("from-height", 0, "first height to upload")
+	rangeSize := flags.Uint64("range-size", blocksync.DefaultRangeSize, "range index size")
+	stableDelay := flags.Uint64("stable-delay", blocksync.DefaultStableDelay, "stable block delay before publishing range indexes")
+	follow := flags.Bool("follow", false, "keep polling and uploading")
+	interval := flags.Duration("interval", 30*time.Second, "follow polling interval")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	rpcClient, err := newRPCClient(*rpcURL, *cookieFile, *rpcUser, *rpcPassword)
+	if err != nil {
+		return err
+	}
+	r2cfg, err := r2store.LoadConfigFromEnv()
+	if err != nil {
+		return err
+	}
+	writer, err := r2store.NewWriter(ctx, r2cfg)
+	if err != nil {
+		return err
+	}
+
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	cfg := blocksync.UploadConfig{
+		FromHeight:  *fromHeight,
+		RangeSize:   *rangeSize,
+		StableDelay: *stableDelay,
+		Logger:      logger,
+	}
+	for {
+		if err := blocksync.UploadOnce(ctx, rpcClient, writer, cfg); err != nil {
+			return err
+		}
+		if !*follow {
+			return nil
+		}
+		if err := blocksync.SleepOrDone(ctx, *interval); err != nil {
+			return nil
+		}
+	}
+}
+
+func runSubmit(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("submit", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	baseURL := flags.String("base-url", "", "public R2 download base URL")
+	rpcURL := flags.String("rpc-url", defaultRPCURL, "bitcoind RPC URL")
+	cookieFile := flags.String("cookie-file", "", "bitcoind cookie file")
+	rpcUser := flags.String("rpc-user", "", "bitcoind RPC username")
+	rpcPassword := flags.String("rpc-password", "", "bitcoind RPC password")
+	rangeSize := flags.Uint64("range-size", blocksync.DefaultRangeSize, "range index size")
+	recentWalkLimit := flags.Uint64("recent-walk-limit", blocksync.DefaultRecentWalkLimit, "maximum recent header walk")
+	follow := flags.Bool("follow", false, "keep submitting as headers arrive")
+	interval := flags.Duration("interval", 10*time.Second, "follow polling interval")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+
+	rpcClient, err := newRPCClient(*rpcURL, *cookieFile, *rpcUser, *rpcPassword)
+	if err != nil {
+		return err
+	}
+	downloader, err := r2store.NewPublicClient(*baseURL, nil)
+	if err != nil {
+		return err
+	}
+
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	cfg := blocksync.SubmitConfig{
+		RangeSize:       *rangeSize,
+		RecentWalkLimit: *recentWalkLimit,
+		Logger:          logger,
+	}
+	for {
+		result, err := blocksync.SubmitNext(ctx, rpcClient, downloader, cfg)
+		if err != nil {
+			return err
+		}
+		if result.WaitHeaders {
+			logger.Printf("waiting for local headers target_height=%d", result.TargetHeight)
+			if !*follow {
+				return nil
+			}
+			if err := blocksync.SleepOrDone(ctx, *interval); err != nil {
+				return nil
+			}
+			continue
+		}
+		if !*follow {
+			return nil
+		}
+	}
+}
+
+func newRPCClient(rpcURL string, cookieFile string, rpcUser string, rpcPassword string) (*btcrpc.Client, error) {
+	opts := []btcrpc.Option{}
+	if cookieFile != "" {
+		opts = append(opts, btcrpc.WithCookieFile(cookieFile))
+	}
+	if rpcUser != "" || rpcPassword != "" {
+		opts = append(opts, btcrpc.WithBasicAuth(rpcUser, rpcPassword))
+	}
+	return btcrpc.New(rpcURL, opts...)
+}
+
+func printUsage() {
+	fmt.Fprintln(os.Stderr, "usage: fractal-block-sync <upload|submit> [flags]")
+	fmt.Fprintln(os.Stderr, "")
+	fmt.Fprintln(os.Stderr, "commands:")
+	fmt.Fprintln(os.Stderr, "  upload  upload raw blocks and stable range indexes to R2")
+	fmt.Fprintln(os.Stderr, "  submit  download, verify, and submit the next missing block")
+}
