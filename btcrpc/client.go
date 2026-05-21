@@ -201,7 +201,7 @@ func (c *Client) GetBlockHash(ctx context.Context, height uint64) (string, error
 
 func (c *Client) GetBlockRawHex(ctx context.Context, hash string) (string, error) {
 	var rawHex string
-	err := c.Call(ctx, "getblock", []any{hash, 0}, &rawHex)
+	err := c.Call(ctx, "getblock", []any{hash, 0, true}, &rawHex)
 	return rawHex, err
 }
 

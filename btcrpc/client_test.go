@@ -91,6 +91,35 @@ func TestWithCookieFile(t *testing.T) {
 	}
 }
 
+func TestGetBlockRawHexRequestsAuxPow(t *testing.T) {
+	var captured capturedRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&captured); err != nil {
+			t.Fatalf("Decode request returned error: %v", err)
+		}
+		_, _ = w.Write([]byte(`{"result":"00","error":null,"id":1}`))
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("New returned error: %v", err)
+	}
+	rawHex, err := client.GetBlockRawHex(context.Background(), "hash")
+	if err != nil {
+		t.Fatalf("GetBlockRawHex returned error: %v", err)
+	}
+	if rawHex != "00" {
+		t.Fatalf("raw hex = %q, want 00", rawHex)
+	}
+	if captured.Method != "getblock" || len(captured.Params) != 3 {
+		t.Fatalf("captured request = %+v, want getblock with 3 params", captured)
+	}
+	if captured.Params[0] != "hash" || captured.Params[1].(float64) != 0 || captured.Params[2] != true {
+		t.Fatalf("captured params = %#v, want [hash, 0, true]", captured.Params)
+	}
+}
+
 func TestHighLevelMethods(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req capturedRequest
