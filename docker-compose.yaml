@@ -39,6 +39,7 @@ services:
       FROM_HEIGHT: ${FROM_HEIGHT:-0}
       RANGE_SIZE: ${RANGE_SIZE:-2880}
       STABLE_DELAY: ${STABLE_DELAY:-2880}
+      UPLOAD_WORKERS: ${UPLOAD_WORKERS:-4}
       UPLOAD_INTERVAL: ${UPLOAD_INTERVAL:-30s}
     entrypoint:
       - /bin/sh
@@ -50,6 +51,7 @@ services:
           --from-height "$${FROM_HEIGHT}" \
           --range-size "$${RANGE_SIZE}" \
           --stable-delay "$${STABLE_DELAY}" \
+          --upload-workers "$${UPLOAD_WORKERS}" \
           --interval "$${UPLOAD_INTERVAL}" \
           --follow
         if [ -n "$${BITCOIN_COOKIE_FILE:-}" ]; then
@@ -73,6 +75,7 @@ services:
       BITCOIN_COOKIE_FILE: ${BITCOIN_COOKIE_FILE:-}
       RANGE_SIZE: ${RANGE_SIZE:-2880}
       RECENT_WALK_LIMIT: ${RECENT_WALK_LIMIT:-2880}
+      BOOTSTRAP_FROM_R2: ${BOOTSTRAP_FROM_R2:-false}
       SUBMIT_INTERVAL: ${SUBMIT_INTERVAL:-10s}
     entrypoint:
       - /bin/sh
@@ -86,6 +89,9 @@ services:
           --recent-walk-limit "$${RECENT_WALK_LIMIT}" \
           --interval "$${SUBMIT_INTERVAL}" \
           --follow
+        if [ "$${BOOTSTRAP_FROM_R2:-false}" = "true" ]; then
+          set -- "$$@" --bootstrap-from-r2
+        fi
         if [ -n "$${BITCOIN_COOKIE_FILE:-}" ]; then
           set -- "$$@" --cookie-file /data/.bitcoin/.cookie
         fi

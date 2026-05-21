@@ -8,7 +8,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"fractal-block-sync/btcrpc"
 	"fractal-block-sync/r2store"
@@ -19,6 +21,11 @@ type fakeUploadRPC struct {
 	tip    uint64
 	hashes map[uint64]string
 	blocks map[string]string
+
+	mu           sync.Mutex
+	active       int
+	maxActive    int
+	rawBlockGate chan struct{}
 }
 
 func (f *fakeUploadRPC) GetBlockCount(ctx context.Context) (uint64, error) {
@@ -34,6 +41,30 @@ func (f *fakeUploadRPC) GetBlockHash(ctx context.Context, height uint64) (string
 }
 
 func (f *fakeUploadRPC) GetBlockRawHex(ctx context.Context, hash string) (string, error) {
+	f.mu.Lock()
+	f.active++
+	if f.active > f.maxActive {
+		f.maxActive = f.active
+	}
+	f.mu.Unlock()
+
+	if f.rawBlockGate != nil {
+		select {
+		case <-ctx.Done():
+			f.mu.Lock()
+			f.active--
+			f.mu.Unlock()
+			return "", ctx.Err()
+		case <-f.rawBlockGate:
+		}
+	}
+
+	defer func() {
+		f.mu.Lock()
+		f.active--
+		f.mu.Unlock()
+	}()
+
 	rawHex, ok := f.blocks[hash]
 	if !ok {
 		return "", fmt.Errorf("missing block %s", hash)
@@ -42,23 +73,31 @@ func (f *fakeUploadRPC) GetBlockRawHex(ctx context.Context, hash string) (string
 }
 
 type fakeWriter struct {
+	mu     sync.Mutex
 	blocks map[string][]byte
 	index  map[string][]byte
+	events []string
 }
 
 func (f *fakeWriter) UploadBlock(ctx context.Context, hash string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.blocks == nil {
 		f.blocks = map[string][]byte{}
 	}
 	f.blocks[hash] = append([]byte(nil), data...)
+	f.events = append(f.events, "block:"+hash)
 	return nil
 }
 
 func (f *fakeWriter) UploadRangeIndex(ctx context.Context, key string, data []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.index == nil {
 		f.index = map[string][]byte{}
 	}
 	f.index[key] = append([]byte(nil), data...)
+	f.events = append(f.events, "index:"+key)
 	return nil
 }
 
@@ -95,6 +134,49 @@ func TestUploadOnceUploadsBlocksAndStableRangeIndex(t *testing.T) {
 	}
 }
 
+func TestUploadOnceUploadsBlocksInParallel(t *testing.T) {
+	hashes := map[uint64]string{}
+	blocks := map[string]string{}
+	for height := uint64(0); height < 4; height++ {
+		hash := fmt.Sprintf("%064x", height+1)
+		hashes[height] = hash
+		blocks[hash] = hex.EncodeToString([]byte{byte(height)})
+	}
+	gate := make(chan struct{})
+	rpc := &fakeUploadRPC{tip: 3, hashes: hashes, blocks: blocks, rawBlockGate: gate}
+	writer := &fakeWriter{}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- UploadOnce(context.Background(), rpc, writer, UploadConfig{RangeSize: 4, StableDelay: 4, UploadWorkers: 4})
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for active := 0; active < 2; {
+		rpc.mu.Lock()
+		active = rpc.active
+		rpc.mu.Unlock()
+		select {
+		case <-deadline:
+			close(gate)
+			t.Fatalf("timed out waiting for concurrent uploads, active=%d", active)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+
+	if err := <-done; err != nil {
+		t.Fatalf("UploadOnce returned error: %v", err)
+	}
+	if len(writer.blocks) != 4 {
+		t.Fatalf("uploaded blocks = %d, want 4", len(writer.blocks))
+	}
+	if rpc.maxActive < 2 {
+		t.Fatalf("max concurrent raw block requests = %d, want at least 2", rpc.maxActive)
+	}
+}
+
 func TestUploadOnceDoesNotPublishPartialStartingRange(t *testing.T) {
 	hashes := map[uint64]string{}
 	blocks := map[string]string{}
@@ -116,6 +198,44 @@ func TestUploadOnceDoesNotPublishPartialStartingRange(t *testing.T) {
 	if _, ok := writer.index["index/range/v1/size-3/0000000003.bin"]; !ok {
 		t.Fatal("did not publish complete range after from-height")
 	}
+}
+
+func TestUploadOncePublishesStableRangeIndexBeforeLaterBlocks(t *testing.T) {
+	hashes := map[uint64]string{}
+	blocks := map[string]string{}
+	for height := uint64(0); height < 6; height++ {
+		hash := fmt.Sprintf("%064x", height+1)
+		hashes[height] = hash
+		blocks[hash] = hex.EncodeToString([]byte{byte(height)})
+	}
+	rpc := &fakeUploadRPC{tip: 5, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+
+	err := UploadOnce(context.Background(), rpc, writer, UploadConfig{RangeSize: 3, StableDelay: 0, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("UploadOnce returned error: %v", err)
+	}
+
+	firstIndex := indexOfEvent(writer.events, "index:index/range/v1/size-3/0000000000.bin")
+	blockAfterFirstRange := indexOfEvent(writer.events, "block:"+hashes[3])
+	if firstIndex == -1 {
+		t.Fatalf("events = %v, missing first range index", writer.events)
+	}
+	if blockAfterFirstRange == -1 {
+		t.Fatalf("events = %v, missing block after first range", writer.events)
+	}
+	if firstIndex > blockAfterFirstRange {
+		t.Fatalf("events = %v, first range index was not published before later blocks", writer.events)
+	}
+}
+
+func indexOfEvent(events []string, want string) int {
+	for i, event := range events {
+		if event == want {
+			return i
+		}
+	}
+	return -1
 }
 
 type fakeSubmitRPC struct {
@@ -218,6 +338,38 @@ func TestSubmitNextWaitsForHeaders(t *testing.T) {
 	}
 	if !result.WaitHeaders || result.TargetHeight != 11 {
 		t.Fatalf("result = %+v, want wait for height 11", result)
+	}
+}
+
+func TestSubmitNextBootstrapsFromR2WithoutHeaders(t *testing.T) {
+	raw, hash := testRawBlock(t, 1)
+	bin, err := rangeindex.Encode([]string{fmt.Sprintf("%064x", 1), hash}, 2)
+	if err != nil {
+		t.Fatalf("Encode returned error: %v", err)
+	}
+	rpc := &fakeSubmitRPC{info: btcrpc.BlockchainInfo{Blocks: 0, Headers: 0}}
+	downloader := &fakeDownloader{
+		objects: map[string][]byte{"index/range/v1/size-2/0000000000.bin": bin},
+		blocks:  map[string][]byte{hash: raw},
+	}
+
+	result, err := SubmitNext(context.Background(), rpc, downloader, SubmitConfig{RangeSize: 2, BootstrapFromR2: true})
+	if err != nil {
+		t.Fatalf("SubmitNext returned error: %v", err)
+	}
+	if !result.Submitted || result.WaitHeaders || result.Hash != hash || len(rpc.submits) != 1 {
+		t.Fatalf("result = %+v submits=%d, want R2 bootstrap submit hash %s", result, len(rpc.submits), hash)
+	}
+}
+
+func TestSubmitNextBootstrapWaitsForHeadersOrR2Index(t *testing.T) {
+	rpc := &fakeSubmitRPC{info: btcrpc.BlockchainInfo{Blocks: 0, Headers: 0}}
+	result, err := SubmitNext(context.Background(), rpc, &fakeDownloader{}, SubmitConfig{RangeSize: 2, BootstrapFromR2: true})
+	if err != nil {
+		t.Fatalf("SubmitNext returned error: %v", err)
+	}
+	if !result.WaitHeaders || !result.WaitR2Index || result.TargetHeight != 1 {
+		t.Fatalf("result = %+v, want wait for headers or R2 index at height 1", result)
 	}
 }
 

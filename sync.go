@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"fractal-block-sync/blockhash"
@@ -19,6 +20,7 @@ const (
 	DefaultRangeSize       = rangeindex.DefaultRangeSize
 	DefaultStableDelay     = 2880
 	DefaultRecentWalkLimit = 2880
+	DefaultUploadWorkers   = 4
 )
 
 // BlockProvider is the bitcoind RPC subset required by UploadOnce.
@@ -36,10 +38,11 @@ type ObjectWriter interface {
 
 // UploadConfig controls provider upload behavior.
 type UploadConfig struct {
-	FromHeight  uint64
-	RangeSize   uint64
-	StableDelay uint64
-	Logger      *log.Logger
+	FromHeight    uint64
+	RangeSize     uint64
+	StableDelay   uint64
+	UploadWorkers uint
+	Logger        *log.Logger
 }
 
 // UploadOnce uploads blocks from FromHeight to the current local tip and
@@ -59,66 +62,169 @@ func UploadOnce(ctx context.Context, rpc BlockProvider, writer ObjectWriter, cfg
 		return nil
 	}
 
-	for height := cfg.FromHeight; height <= tip; height++ {
-		hash, err := rpc.GetBlockHash(ctx, height)
-		if err != nil {
-			return fmt.Errorf("get block hash at height %d: %w", height, err)
-		}
-		rawHex, err := rpc.GetBlockRawHex(ctx, hash)
-		if err != nil {
-			return fmt.Errorf("get raw block %s at height %d: %w", hash, height, err)
-		}
-		raw, err := hex.DecodeString(strings.TrimSpace(rawHex))
-		if err != nil {
-			return fmt.Errorf("decode raw block %s at height %d: %w", hash, height, err)
-		}
-		if err := writer.UploadBlock(ctx, hash, raw); err != nil {
-			return fmt.Errorf("upload block %s at height %d: %w", hash, height, err)
-		}
-		if cfg.Logger != nil {
-			cfg.Logger.Printf("uploaded block height=%d hash=%s", height, hash)
-		}
+	uploadWorkers := cfg.UploadWorkers
+	if uploadWorkers == 0 {
+		uploadWorkers = DefaultUploadWorkers
 	}
 
-	if tip < stableDelay {
-		return nil
-	}
-	stableTip := tip - stableDelay
-	fromStart, err := rangeindex.StartHeight(cfg.FromHeight, rangeSize)
-	if err != nil {
-		return err
-	}
-	if fromStart < cfg.FromHeight {
-		fromStart += rangeSize
-	}
-	for start := fromStart; start <= stableTip && stableTip-start+1 >= rangeSize; start += rangeSize {
-		hashes := make([]string, 0, rangeSize)
-		for height := start; height < start+rangeSize; height++ {
-			hash, err := rpc.GetBlockHash(ctx, height)
-			if err != nil {
-				return fmt.Errorf("get range hash at height %d: %w", height, err)
-			}
-			hashes = append(hashes, hash)
-		}
-		bin, err := rangeindex.Encode(hashes, rangeSize)
-		if err != nil {
-			return fmt.Errorf("encode range index start %d: %w", start, err)
-		}
-		key, err := rangeindex.ObjectKey(start, rangeSize)
+	nextHeight := cfg.FromHeight
+	if tip >= stableDelay {
+		stableTip := tip - stableDelay
+		fromStart, err := rangeindex.StartHeight(cfg.FromHeight, rangeSize)
 		if err != nil {
 			return err
 		}
-		if err := writer.UploadRangeIndex(ctx, key, bin); err != nil {
-			return fmt.Errorf("upload range index %s: %w", key, err)
+		if fromStart < cfg.FromHeight {
+			fromStart += rangeSize
 		}
-		if cfg.Logger != nil {
-			cfg.Logger.Printf("uploaded range index start=%d key=%s", start, key)
+
+		if nextHeight < fromStart {
+			end := fromStart - 1
+			if end > tip {
+				end = tip
+			}
+			if err := uploadBlocks(ctx, rpc, writer, nextHeight, end, uploadWorkers, cfg.Logger); err != nil {
+				return err
+			}
+			if end == tip {
+				return nil
+			}
+			nextHeight = end + 1
 		}
-		if start > ^uint64(0)-rangeSize {
-			break
+
+		for start := fromStart; start <= stableTip && stableTip-start+1 >= rangeSize; start += rangeSize {
+			end := start + rangeSize - 1
+			if err := uploadBlocks(ctx, rpc, writer, start, end, uploadWorkers, cfg.Logger); err != nil {
+				return err
+			}
+			if err := uploadRangeIndex(ctx, rpc, writer, start, rangeSize, cfg.Logger); err != nil {
+				return err
+			}
+			nextHeight = end + 1
+			if start > ^uint64(0)-rangeSize {
+				break
+			}
 		}
 	}
 
+	if nextHeight <= tip {
+		return uploadBlocks(ctx, rpc, writer, nextHeight, tip, uploadWorkers, cfg.Logger)
+	}
+	return nil
+}
+
+func uploadRangeIndex(ctx context.Context, rpc BlockProvider, writer ObjectWriter, start uint64, rangeSize uint64, logger *log.Logger) error {
+	hashes := make([]string, 0, rangeSize)
+	for height := start; height < start+rangeSize; height++ {
+		hash, err := rpc.GetBlockHash(ctx, height)
+		if err != nil {
+			return fmt.Errorf("get range hash at height %d: %w", height, err)
+		}
+		hashes = append(hashes, hash)
+	}
+	bin, err := rangeindex.Encode(hashes, rangeSize)
+	if err != nil {
+		return fmt.Errorf("encode range index start %d: %w", start, err)
+	}
+	key, err := rangeindex.ObjectKey(start, rangeSize)
+	if err != nil {
+		return err
+	}
+	if err := writer.UploadRangeIndex(ctx, key, bin); err != nil {
+		return fmt.Errorf("upload range index %s: %w", key, err)
+	}
+	if logger != nil {
+		logger.Printf("uploaded range index start=%d key=%s", start, key)
+	}
+	return nil
+}
+
+func uploadBlocks(ctx context.Context, rpc BlockProvider, writer ObjectWriter, fromHeight uint64, tip uint64, workers uint, logger *log.Logger) error {
+	if fromHeight > tip {
+		return nil
+	}
+	if workers <= 1 {
+		for height := fromHeight; ; height++ {
+			if err := uploadBlock(ctx, rpc, writer, height, logger); err != nil {
+				return err
+			}
+			if height == tip {
+				break
+			}
+		}
+		return nil
+	}
+
+	uploadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan uint64)
+	errs := make(chan error, 1)
+	var wg sync.WaitGroup
+	for worker := uint(0); worker < workers; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for height := range jobs {
+				if err := uploadBlock(uploadCtx, rpc, writer, height, logger); err != nil {
+					select {
+					case errs <- err:
+						cancel()
+					default:
+					}
+					return
+				}
+			}
+		}()
+	}
+
+	for height := fromHeight; ; height++ {
+		select {
+		case <-uploadCtx.Done():
+			close(jobs)
+			wg.Wait()
+			select {
+			case err := <-errs:
+				return err
+			default:
+				return uploadCtx.Err()
+			}
+		case jobs <- height:
+		}
+		if height == tip {
+			break
+		}
+	}
+	close(jobs)
+	wg.Wait()
+
+	select {
+	case err := <-errs:
+		return err
+	default:
+		return nil
+	}
+}
+
+func uploadBlock(ctx context.Context, rpc BlockProvider, writer ObjectWriter, height uint64, logger *log.Logger) error {
+	hash, err := rpc.GetBlockHash(ctx, height)
+	if err != nil {
+		return fmt.Errorf("get block hash at height %d: %w", height, err)
+	}
+	rawHex, err := rpc.GetBlockRawHex(ctx, hash)
+	if err != nil {
+		return fmt.Errorf("get raw block %s at height %d: %w", hash, height, err)
+	}
+	raw, err := hex.DecodeString(strings.TrimSpace(rawHex))
+	if err != nil {
+		return fmt.Errorf("decode raw block %s at height %d: %w", hash, height, err)
+	}
+	if err := writer.UploadBlock(ctx, hash, raw); err != nil {
+		return fmt.Errorf("upload block %s at height %d: %w", hash, height, err)
+	}
+	if logger != nil {
+		logger.Printf("uploaded block height=%d hash=%s", height, hash)
+	}
 	return nil
 }
 
@@ -140,6 +246,7 @@ type ObjectDownloader interface {
 type SubmitConfig struct {
 	RangeSize       uint64
 	RecentWalkLimit uint64
+	BootstrapFromR2 bool
 	Logger          *log.Logger
 }
 
@@ -149,6 +256,7 @@ type SubmitResult struct {
 	Hash         string
 	Submitted    bool
 	WaitHeaders  bool
+	WaitR2Index  bool
 	RPCResult    string
 }
 
@@ -167,61 +275,84 @@ func SubmitNext(ctx context.Context, rpc BlockSubmitter, downloader ObjectDownlo
 	target := info.Blocks + 1
 	result := SubmitResult{TargetHeight: target}
 	if target > info.Headers {
-		result.WaitHeaders = true
-		return result, nil
+		if !cfg.BootstrapFromR2 {
+			result.WaitHeaders = true
+			return result, nil
+		}
+		hash, err := resolveTargetHashFromRangeIndex(ctx, downloader, target, rangeSize)
+		if err != nil {
+			if errors.Is(err, r2store.ErrNotFound) {
+				result.WaitHeaders = true
+				result.WaitR2Index = true
+				return result, nil
+			}
+			return result, err
+		}
+		result.Hash = hash
+	} else {
+		hash, err := resolveTargetHash(ctx, rpc, downloader, target, rangeSize, recentWalkLimit)
+		if err != nil {
+			return result, err
+		}
+		result.Hash = hash
 	}
 
-	hash, err := resolveTargetHash(ctx, rpc, downloader, target, rangeSize, recentWalkLimit)
+	raw, err := downloader.DownloadBlock(ctx, result.Hash)
 	if err != nil {
-		return result, err
-	}
-	result.Hash = hash
-
-	raw, err := downloader.DownloadBlock(ctx, hash)
-	if err != nil {
-		return result, fmt.Errorf("download block %s: %w", hash, err)
+		return result, fmt.Errorf("download block %s: %w", result.Hash, err)
 	}
 	gotHash, err := blockhash.FromRawBlock(raw)
 	if err != nil {
 		return result, fmt.Errorf("calculate block hash: %w", err)
 	}
-	if gotHash != hash {
-		return result, fmt.Errorf("downloaded block hash mismatch: got %s, want %s", gotHash, hash)
+	if gotHash != result.Hash {
+		return result, fmt.Errorf("downloaded block hash mismatch: got %s, want %s", gotHash, result.Hash)
 	}
 
 	rpcResult, err := rpc.SubmitBlock(ctx, hex.EncodeToString(raw))
 	if err != nil {
-		return result, fmt.Errorf("submit block %s: %w", hash, err)
+		return result, fmt.Errorf("submit block %s: %w", result.Hash, err)
 	}
 	result.RPCResult = rpcResult
 	result.Submitted = rpcResult == "" || isAlreadyKnownSubmitResult(rpcResult)
 	if !result.Submitted {
-		return result, fmt.Errorf("submit block %s returned %q", hash, rpcResult)
+		return result, fmt.Errorf("submit block %s returned %q", result.Hash, rpcResult)
 	}
 	if cfg.Logger != nil {
-		cfg.Logger.Printf("submitted block height=%d hash=%s", target, hash)
+		cfg.Logger.Printf("submitted block height=%d hash=%s", target, result.Hash)
 	}
 	return result, nil
 }
 
 func resolveTargetHash(ctx context.Context, rpc BlockSubmitter, downloader ObjectDownloader, target uint64, rangeSize uint64, recentWalkLimit uint64) (string, error) {
+	hash, err := resolveTargetHashFromRangeIndex(ctx, downloader, target, rangeSize)
+	if err == nil {
+		return hash, nil
+	}
+	if !errors.Is(err, r2store.ErrNotFound) {
+		return "", err
+	}
+
+	return resolveRecentHash(ctx, rpc, target, recentWalkLimit)
+}
+
+func resolveTargetHashFromRangeIndex(ctx context.Context, downloader ObjectDownloader, target uint64, rangeSize uint64) (string, error) {
 	key, startHeight, err := rangeindex.ObjectKeyForHeight(target, rangeSize)
 	if err != nil {
 		return "", err
 	}
 	bin, err := downloader.DownloadObject(ctx, key)
-	if err == nil {
-		hash, err := rangeindex.HashAt(bin, startHeight, target, rangeSize)
-		if err != nil {
-			return "", fmt.Errorf("read range index %s: %w", key, err)
-		}
-		return hash, nil
+	if errors.Is(err, r2store.ErrNotFound) {
+		return "", err
 	}
-	if !errors.Is(err, r2store.ErrNotFound) {
+	if err != nil {
 		return "", fmt.Errorf("download range index %s: %w", key, err)
 	}
-
-	return resolveRecentHash(ctx, rpc, target, recentWalkLimit)
+	hash, err := rangeindex.HashAt(bin, startHeight, target, rangeSize)
+	if err != nil {
+		return "", fmt.Errorf("read range index %s: %w", key, err)
+	}
+	return hash, nil
 }
 
 func resolveRecentHash(ctx context.Context, rpc BlockSubmitter, target uint64, recentWalkLimit uint64) (string, error) {

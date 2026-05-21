@@ -55,6 +55,7 @@ func runUpload(ctx context.Context, args []string) error {
 	fromHeight := flags.Uint64("from-height", 0, "first height to upload")
 	rangeSize := flags.Uint64("range-size", blocksync.DefaultRangeSize, "range index size")
 	stableDelay := flags.Uint64("stable-delay", blocksync.DefaultStableDelay, "stable block delay before publishing range indexes")
+	uploadWorkers := flags.Uint("upload-workers", blocksync.DefaultUploadWorkers, "parallel block upload workers")
 	follow := flags.Bool("follow", false, "keep polling and uploading")
 	interval := flags.Duration("interval", 30*time.Second, "follow polling interval")
 	if err := flags.Parse(args); err != nil {
@@ -76,10 +77,11 @@ func runUpload(ctx context.Context, args []string) error {
 
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	cfg := blocksync.UploadConfig{
-		FromHeight:  *fromHeight,
-		RangeSize:   *rangeSize,
-		StableDelay: *stableDelay,
-		Logger:      logger,
+		FromHeight:    *fromHeight,
+		RangeSize:     *rangeSize,
+		StableDelay:   *stableDelay,
+		UploadWorkers: *uploadWorkers,
+		Logger:        logger,
 	}
 	for {
 		if err := blocksync.UploadOnce(ctx, rpcClient, writer, cfg); err != nil {
@@ -104,6 +106,7 @@ func runSubmit(ctx context.Context, args []string) error {
 	rpcPassword := flags.String("rpc-password", "", "bitcoind RPC password")
 	rangeSize := flags.Uint64("range-size", blocksync.DefaultRangeSize, "range index size")
 	recentWalkLimit := flags.Uint64("recent-walk-limit", blocksync.DefaultRecentWalkLimit, "maximum recent header walk")
+	bootstrapFromR2 := flags.Bool("bootstrap-from-r2", false, "submit using R2 range indexes when local headers are unavailable")
 	follow := flags.Bool("follow", false, "keep submitting as headers arrive")
 	interval := flags.Duration("interval", 10*time.Second, "follow polling interval")
 	if err := flags.Parse(args); err != nil {
@@ -123,6 +126,7 @@ func runSubmit(ctx context.Context, args []string) error {
 	cfg := blocksync.SubmitConfig{
 		RangeSize:       *rangeSize,
 		RecentWalkLimit: *recentWalkLimit,
+		BootstrapFromR2: *bootstrapFromR2,
 		Logger:          logger,
 	}
 	for {
@@ -131,7 +135,11 @@ func runSubmit(ctx context.Context, args []string) error {
 			return err
 		}
 		if result.WaitHeaders {
-			logger.Printf("waiting for local headers target_height=%d", result.TargetHeight)
+			if result.WaitR2Index {
+				logger.Printf("waiting for local headers or R2 range index target_height=%d", result.TargetHeight)
+			} else {
+				logger.Printf("waiting for local headers target_height=%d", result.TargetHeight)
+			}
 			if !*follow {
 				return nil
 			}
