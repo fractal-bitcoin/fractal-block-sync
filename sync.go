@@ -75,24 +75,37 @@ func UploadOnce(ctx context.Context, rpc BlockProvider, writer ObjectWriter, cfg
 			return err
 		}
 		if fromStart < cfg.FromHeight {
-			fromStart += rangeSize
-		}
-
-		if nextHeight < fromStart {
-			end := fromStart - 1
-			if end > tip {
-				end = tip
+			partialEnd := fromStart + rangeSize - 1
+			if partialEnd <= stableTip {
+				if err := uploadBlocks(ctx, rpc, writer, cfg.FromHeight, partialEnd, uploadWorkers, cfg.Logger); err != nil {
+					return err
+				}
+				if err := uploadRangeIndex(ctx, rpc, writer, fromStart, rangeSize, cfg.Logger); err != nil {
+					return err
+				}
+				nextHeight = partialEnd + 1
+			} else {
+				fromStart += rangeSize
+				if nextHeight < fromStart {
+					end := fromStart - 1
+					if end > tip {
+						end = tip
+					}
+					if err := uploadBlocks(ctx, rpc, writer, nextHeight, end, uploadWorkers, cfg.Logger); err != nil {
+						return err
+					}
+					if end == tip {
+						return nil
+					}
+					nextHeight = end + 1
+				}
 			}
-			if err := uploadBlocks(ctx, rpc, writer, nextHeight, end, uploadWorkers, cfg.Logger); err != nil {
-				return err
-			}
-			if end == tip {
-				return nil
-			}
-			nextHeight = end + 1
 		}
 
 		for start := fromStart; start <= stableTip && stableTip-start+1 >= rangeSize; start += rangeSize {
+			if start < nextHeight {
+				continue
+			}
 			end := start + rangeSize - 1
 			if err := uploadBlocks(ctx, rpc, writer, start, end, uploadWorkers, cfg.Logger); err != nil {
 				return err

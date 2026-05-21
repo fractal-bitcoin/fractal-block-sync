@@ -177,7 +177,7 @@ func TestUploadOnceUploadsBlocksInParallel(t *testing.T) {
 	}
 }
 
-func TestUploadOnceDoesNotPublishPartialStartingRange(t *testing.T) {
+func TestUploadOncePublishesStablePartialStartingRangeWithoutEarlierBlocks(t *testing.T) {
 	hashes := map[uint64]string{}
 	blocks := map[string]string{}
 	for height := uint64(0); height < 6; height++ {
@@ -192,11 +192,37 @@ func TestUploadOnceDoesNotPublishPartialStartingRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UploadOnce returned error: %v", err)
 	}
-	if _, ok := writer.index["index/range/v1/size-3/0000000000.bin"]; ok {
-		t.Fatal("published partial starting range")
+	if _, ok := writer.blocks[hashes[0]]; ok {
+		t.Fatal("uploaded block before from-height")
+	}
+	if _, ok := writer.index["index/range/v1/size-3/0000000000.bin"]; !ok {
+		t.Fatal("did not publish stable partial starting range")
 	}
 	if _, ok := writer.index["index/range/v1/size-3/0000000003.bin"]; !ok {
 		t.Fatal("did not publish complete range after from-height")
+	}
+}
+
+func TestUploadOnceDoesNotPublishUnstablePartialStartingRange(t *testing.T) {
+	hashes := map[uint64]string{}
+	blocks := map[string]string{}
+	for height := uint64(0); height < 6; height++ {
+		hash := fmt.Sprintf("%064x", height+1)
+		hashes[height] = hash
+		blocks[hash] = hex.EncodeToString([]byte{byte(height)})
+	}
+	rpc := &fakeUploadRPC{tip: 5, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+
+	err := UploadOnce(context.Background(), rpc, writer, UploadConfig{FromHeight: 1, RangeSize: 3, StableDelay: 4})
+	if err != nil {
+		t.Fatalf("UploadOnce returned error: %v", err)
+	}
+	if _, ok := writer.index["index/range/v1/size-3/0000000000.bin"]; ok {
+		t.Fatal("published unstable partial starting range")
+	}
+	if _, ok := writer.blocks[hashes[1]]; !ok {
+		t.Fatal("did not upload from-height block")
 	}
 }
 
