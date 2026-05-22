@@ -16,6 +16,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 const (
@@ -125,12 +127,45 @@ func (w *Writer) UploadBlock(ctx context.Context, hash string, data []byte) erro
 	return w.PutObject(ctx, key, data, "application/octet-stream")
 }
 
+// BlockExists reports whether a single Bitcoin block object exists.
+func (w *Writer) BlockExists(ctx context.Context, hash string) (bool, error) {
+	key, err := BlockKey(hash)
+	if err != nil {
+		return false, err
+	}
+	return w.ObjectExists(ctx, key)
+}
+
 // UploadRangeIndex uploads a range index object.
 func (w *Writer) UploadRangeIndex(ctx context.Context, key string, data []byte) error {
 	if strings.TrimSpace(key) == "" {
 		return errors.New("range index key is required")
 	}
 	return w.PutObject(ctx, key, data, "application/octet-stream")
+}
+
+// ObjectExists reports whether one object key exists.
+func (w *Writer) ObjectExists(ctx context.Context, key string) (bool, error) {
+	if strings.TrimSpace(key) == "" {
+		return false, errors.New("object key is required")
+	}
+
+	_, err := w.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(w.bucket),
+		Key:    aws.String(key),
+	})
+	if err == nil {
+		return true, nil
+	}
+	var notFound *types.NotFound
+	if errors.As(err, &notFound) {
+		return false, nil
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "NotFound" || apiErr.ErrorCode() == "NoSuchKey") {
+		return false, nil
+	}
+	return false, fmt.Errorf("head object %s: %w", key, err)
 }
 
 // PutObject uploads bytes to one object key.
@@ -148,8 +183,13 @@ func (w *Writer) PutObject(ctx context.Context, key string, data []byte, content
 		Body:          bytes.NewReader(data),
 		ContentLength: aws.Int64(int64(len(data))),
 		ContentType:   aws.String(contentType),
+		IfNoneMatch:   aws.String("*"),
 	})
 	if err != nil {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && (apiErr.ErrorCode() == "PreconditionFailed" || apiErr.ErrorCode() == "ConditionalRequestConflict") {
+			return nil
+		}
 		return fmt.Errorf("upload object %s: %w", key, err)
 	}
 

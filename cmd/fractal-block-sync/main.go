@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strconv"
 	"time"
 
 	blocksync "fractal-block-sync"
@@ -52,7 +53,8 @@ func runUpload(ctx context.Context, args []string) error {
 	cookieFile := flags.String("cookie-file", "", "bitcoind cookie file")
 	rpcUser := flags.String("rpc-user", "", "bitcoind RPC username")
 	rpcPassword := flags.String("rpc-password", "", "bitcoind RPC password")
-	fromHeight := flags.Uint64("from-height", 0, "first height to upload")
+	fromHeight := flags.Uint64("from-height", 0, "height whose range should be checked first")
+	toHeightText := flags.String("to-height", "", "last height to upload, inclusive")
 	rangeSize := flags.Uint64("range-size", blocksync.DefaultRangeSize, "range index size")
 	stableDelay := flags.Uint64("stable-delay", blocksync.DefaultStableDelay, "stable block delay before publishing range indexes")
 	uploadWorkers := flags.Uint("upload-workers", blocksync.DefaultUploadWorkers, "parallel block upload workers")
@@ -60,6 +62,14 @@ func runUpload(ctx context.Context, args []string) error {
 	interval := flags.Duration("interval", 30*time.Second, "follow polling interval")
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	var toHeight *uint64
+	if *toHeightText != "" {
+		parsed, err := strconv.ParseUint(*toHeightText, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid --to-height %q: %w", *toHeightText, err)
+		}
+		toHeight = &parsed
 	}
 
 	rpcClient, err := newRPCClient(*rpcURL, *cookieFile, *rpcUser, *rpcPassword)
@@ -78,6 +88,7 @@ func runUpload(ctx context.Context, args []string) error {
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	cfg := blocksync.UploadConfig{
 		FromHeight:    *fromHeight,
+		ToHeight:      toHeight,
 		RangeSize:     *rangeSize,
 		StableDelay:   *stableDelay,
 		UploadWorkers: *uploadWorkers,
@@ -85,7 +96,17 @@ func runUpload(ctx context.Context, args []string) error {
 	}
 	for {
 		if err := blocksync.UploadOnce(ctx, rpcClient, writer, cfg); err != nil {
-			return err
+			if !*follow {
+				return err
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			logger.Printf("upload failed: %v", err)
+			if err := blocksync.SleepOrDone(ctx, *interval); err != nil {
+				return nil
+			}
+			continue
 		}
 		if !*follow {
 			return nil

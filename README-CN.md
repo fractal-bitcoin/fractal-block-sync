@@ -100,7 +100,8 @@ ENDPOINT_URL       R2 endpoint
 ACCESS_KEY_ID     R2 access key
 SECRET_ACCESS_KEY R2 secret key
 BUCKET_NAME       R2 bucket
-FROM_HEIGHT       起始上传高度，默认 0
+FROM_HEIGHT       从该高度所在 range 开始检查，默认 0
+TO_HEIGHT         结束上传高度，包含该高度；为空表示当前 tip
 RANGE_SIZE        range index 大小，默认 2880
 STABLE_DELAY      距离 tip 多少个块以内不发布 index，默认 2880
 UPLOAD_WORKERS    并发上传数量，默认 4
@@ -161,4 +162,3 @@ GOCACHE=$(pwd)/.gocache go test ./...
 - `waiting for local headers`：等待本地 headers 同步，或在 R2 index 已存在时开启 `BOOTSTRAP_FROM_R2=true`。
 - `waiting for local headers or R2 range index`：对应 range index 尚未发布或 `BASE_URL` 不可访问。
 - `downloaded block hash mismatch`：下载区块与目标 hash 不匹配，程序不会提交。
-

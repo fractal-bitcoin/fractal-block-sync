@@ -32,6 +32,8 @@ type BlockProvider interface {
 
 // ObjectWriter is the R2 writer subset required by UploadOnce.
 type ObjectWriter interface {
+	BlockExists(ctx context.Context, hash string) (bool, error)
+	ObjectExists(ctx context.Context, key string) (bool, error)
 	UploadBlock(ctx context.Context, hash string, data []byte) error
 	UploadRangeIndex(ctx context.Context, key string, data []byte) error
 }
@@ -39,14 +41,15 @@ type ObjectWriter interface {
 // UploadConfig controls provider upload behavior.
 type UploadConfig struct {
 	FromHeight    uint64
+	ToHeight      *uint64
 	RangeSize     uint64
 	StableDelay   uint64
 	UploadWorkers uint
 	Logger        *log.Logger
 }
 
-// UploadOnce uploads blocks from FromHeight to the current local tip and
-// publishes complete stable range indexes.
+// UploadOnce uploads blocks from the range containing FromHeight to the current
+// local tip or ToHeight, and publishes complete stable range indexes.
 func UploadOnce(ctx context.Context, rpc BlockProvider, writer ObjectWriter, cfg UploadConfig) error {
 	rangeSize := cfg.RangeSize
 	if rangeSize == 0 {
@@ -58,7 +61,12 @@ func UploadOnce(ctx context.Context, rpc BlockProvider, writer ObjectWriter, cfg
 	if err != nil {
 		return fmt.Errorf("get block count: %w", err)
 	}
-	if cfg.FromHeight > tip {
+
+	endHeight := tip
+	if cfg.ToHeight != nil && *cfg.ToHeight < endHeight {
+		endHeight = *cfg.ToHeight
+	}
+	if cfg.FromHeight > endHeight {
 		return nil
 	}
 
@@ -67,63 +75,82 @@ func UploadOnce(ctx context.Context, rpc BlockProvider, writer ObjectWriter, cfg
 		uploadWorkers = DefaultUploadWorkers
 	}
 
-	nextHeight := cfg.FromHeight
+	startHeight, err := rangeindex.StartHeight(cfg.FromHeight, rangeSize)
+	if err != nil {
+		return err
+	}
+
+	var stableTip uint64
+	hasStableTip := tip >= stableDelay
 	if tip >= stableDelay {
-		stableTip := tip - stableDelay
-		fromStart, err := rangeindex.StartHeight(cfg.FromHeight, rangeSize)
+		stableTip = tip - stableDelay
+	}
+
+	for start := startHeight; start <= endHeight; {
+		rangeEnd := endOfRange(start, rangeSize)
+		end := rangeEnd
+		if end > endHeight {
+			end = endHeight
+		}
+
+		key, err := rangeindex.ObjectKey(start, rangeSize)
 		if err != nil {
 			return err
 		}
-		if fromStart < cfg.FromHeight {
-			partialEnd := fromStart + rangeSize - 1
-			if partialEnd <= stableTip {
-				if err := uploadBlocks(ctx, rpc, writer, cfg.FromHeight, partialEnd, uploadWorkers, cfg.Logger); err != nil {
-					return err
-				}
-				if err := uploadRangeIndex(ctx, rpc, writer, fromStart, rangeSize, cfg.Logger); err != nil {
-					return err
-				}
-				nextHeight = partialEnd + 1
-			} else {
-				fromStart += rangeSize
-				if nextHeight < fromStart {
-					end := fromStart - 1
-					if end > tip {
-						end = tip
-					}
-					if err := uploadBlocks(ctx, rpc, writer, nextHeight, end, uploadWorkers, cfg.Logger); err != nil {
-						return err
-					}
-					if end == tip {
-						return nil
-					}
-					nextHeight = end + 1
-				}
-			}
+		exists, err := writer.ObjectExists(ctx, key)
+		if err != nil {
+			return fmt.Errorf("check range index %s: %w", key, err)
 		}
-
-		for start := fromStart; start <= stableTip && stableTip-start+1 >= rangeSize; start += rangeSize {
-			if start < nextHeight {
-				continue
+		if exists {
+			if cfg.Logger != nil {
+				cfg.Logger.Printf("skipped existing range index start=%d key=%s", start, key)
 			}
-			end := start + rangeSize - 1
-			if err := uploadBlocks(ctx, rpc, writer, start, end, uploadWorkers, cfg.Logger); err != nil {
-				return err
-			}
-			if err := uploadRangeIndex(ctx, rpc, writer, start, rangeSize, cfg.Logger); err != nil {
-				return err
-			}
-			nextHeight = end + 1
 			if start > ^uint64(0)-rangeSize {
 				break
 			}
+			start += rangeSize
+			continue
 		}
-	}
 
-	if nextHeight <= tip {
-		return uploadBlocks(ctx, rpc, writer, nextHeight, tip, uploadWorkers, cfg.Logger)
+		if err := uploadBlocks(ctx, rpc, writer, start, end, uploadWorkers, cfg.Logger); err != nil {
+			return err
+		}
+		if rangeEnd <= endHeight && hasStableTip && rangeEnd <= stableTip {
+			if err := uploadRangeIndexIfMissing(ctx, rpc, writer, start, rangeSize, cfg.Logger); err != nil {
+				return err
+			}
+		}
+		if start > ^uint64(0)-rangeSize {
+			break
+		}
+		start += rangeSize
 	}
 	return nil
+}
+
+func endOfRange(start uint64, rangeSize uint64) uint64 {
+	if start > ^uint64(0)-rangeSize+1 {
+		return ^uint64(0)
+	}
+	return start + rangeSize - 1
+}
+
+func uploadRangeIndexIfMissing(ctx context.Context, rpc BlockProvider, writer ObjectWriter, start uint64, rangeSize uint64, logger *log.Logger) error {
+	key, err := rangeindex.ObjectKey(start, rangeSize)
+	if err != nil {
+		return err
+	}
+	exists, err := writer.ObjectExists(ctx, key)
+	if err != nil {
+		return fmt.Errorf("check range index %s: %w", key, err)
+	}
+	if exists {
+		if logger != nil {
+			logger.Printf("skipped existing range index start=%d key=%s", start, key)
+		}
+		return nil
+	}
+	return uploadRangeIndex(ctx, rpc, writer, start, rangeSize, logger)
 }
 
 func uploadRangeIndex(ctx context.Context, rpc BlockProvider, writer ObjectWriter, start uint64, rangeSize uint64, logger *log.Logger) error {
@@ -223,6 +250,16 @@ func uploadBlock(ctx context.Context, rpc BlockProvider, writer ObjectWriter, he
 	hash, err := rpc.GetBlockHash(ctx, height)
 	if err != nil {
 		return fmt.Errorf("get block hash at height %d: %w", height, err)
+	}
+	exists, err := writer.BlockExists(ctx, hash)
+	if err != nil {
+		return fmt.Errorf("check block %s at height %d: %w", hash, height, err)
+	}
+	if exists {
+		if logger != nil {
+			logger.Printf("skipped existing block height=%d hash=%s", height, hash)
+		}
+		return nil
 	}
 	rawHex, err := rpc.GetBlockRawHex(ctx, hash)
 	if err != nil {

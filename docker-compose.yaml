@@ -37,6 +37,7 @@ services:
       RPC_PASSWORD: ${RPC_PASSWORD:-}
       BITCOIN_COOKIE_FILE: ${BITCOIN_COOKIE_FILE:-}
       FROM_HEIGHT: ${FROM_HEIGHT:-0}
+      TO_HEIGHT: ${TO_HEIGHT:-}
       RANGE_SIZE: ${RANGE_SIZE:-2880}
       STABLE_DELAY: ${STABLE_DELAY:-2880}
       UPLOAD_WORKERS: ${UPLOAD_WORKERS:-4}
@@ -54,6 +55,9 @@ services:
           --upload-workers "$${UPLOAD_WORKERS}" \
           --interval "$${UPLOAD_INTERVAL}" \
           --follow
+        if [ -n "$${TO_HEIGHT:-}" ]; then
+          set -- "$$@" --to-height "$${TO_HEIGHT}"
+        fi
         if [ -n "$${BITCOIN_COOKIE_FILE:-}" ]; then
           set -- "$$@" --cookie-file /data/.bitcoin/.cookie
         fi

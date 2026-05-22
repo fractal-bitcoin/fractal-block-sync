@@ -102,7 +102,8 @@ ENDPOINT_URL       R2 endpoint
 ACCESS_KEY_ID     R2 access key
 SECRET_ACCESS_KEY R2 secret key
 BUCKET_NAME       R2 bucket
-FROM_HEIGHT       first height to upload, default 0
+FROM_HEIGHT       height whose range should be checked first, default 0
+TO_HEIGHT         last height to upload, inclusive; empty means current tip
 RANGE_SIZE        range index size, default 2880
 STABLE_DELAY      blocks near tip excluded from range indexes, default 2880
 UPLOAD_WORKERS    parallel upload workers, default 4
@@ -163,4 +164,3 @@ GOCACHE=$(pwd)/.gocache go test ./...
 - `waiting for local headers`: wait for header sync or enable `BOOTSTRAP_FROM_R2=true`.
 - `waiting for local headers or R2 range index`: the target range index is not available from `BASE_URL`.
 - `downloaded block hash mismatch`: the downloaded block does not match the expected hash and is not submitted.
-
