@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -27,7 +28,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: fractal-block-sync <upload|submit> [flags]")
+		return errors.New("usage: fractal-block-sync <upload|submit|bench-download> [flags]")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -38,6 +39,8 @@ func run(args []string) error {
 		return runUpload(ctx, args[1:])
 	case "submit":
 		return runSubmit(ctx, args[1:])
+	case "bench-download":
+		return runBenchDownload(ctx, args[1:])
 	case "-h", "--help", "help":
 		printUsage()
 		return nil
@@ -171,6 +174,77 @@ func runSubmit(ctx context.Context, args []string) error {
 	}
 }
 
+func runBenchDownload(ctx context.Context, args []string) error {
+	flags := flag.NewFlagSet("bench-download", flag.ContinueOnError)
+	flags.SetOutput(os.Stderr)
+	baseURL := flags.String("base-url", "", "public R2 download base URL")
+	fromHeightText := flags.String("from-height", "", "first height to download")
+	toHeightText := flags.String("to-height", "", "last height to download, inclusive")
+	workers := flags.Uint("workers", blocksync.DefaultBenchDownloadWorkers, "parallel block download workers")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *fromHeightText == "" {
+		return errors.New("--from-height is required")
+	}
+	fromHeight, err := strconv.ParseUint(*fromHeightText, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid --from-height %q: %w", *fromHeightText, err)
+	}
+	var toHeight *uint64
+	if *toHeightText != "" {
+		parsed, err := strconv.ParseUint(*toHeightText, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid --to-height %q: %w", *toHeightText, err)
+		}
+		toHeight = &parsed
+	}
+
+	downloader, err := r2store.NewPublicClient(*baseURL, newBenchHTTPClient(*workers))
+	if err != nil {
+		return err
+	}
+
+	logger := log.New(os.Stderr, "", log.LstdFlags)
+	result, err := blocksync.BenchDownload(ctx, downloader, blocksync.BenchDownloadConfig{
+		FromHeight: fromHeight,
+		ToHeight:   toHeight,
+		Workers:    *workers,
+		Logger:     logger,
+	})
+	elapsed := result.Duration.Seconds()
+	if elapsed <= 0 {
+		elapsed = 1
+	}
+	logger.Printf(
+		"bench download finished from_height=%d last_height=%d blocks=%d failed=%d bytes=%d average_mib_s=%.2f average_blocks_s=%.2f",
+		result.FromHeight,
+		result.LastHeight,
+		result.DownloadedBlocks,
+		result.FailedBlocks,
+		result.DownloadedBytes,
+		float64(result.DownloadedBytes)/elapsed/1024/1024,
+		float64(result.DownloadedBlocks)/elapsed,
+	)
+	return err
+}
+
+func newBenchHTTPClient(workers uint) *http.Client {
+	idleConns := int(workers) * 2
+	if idleConns < int(blocksync.DefaultBenchDownloadWorkers) {
+		idleConns = int(blocksync.DefaultBenchDownloadWorkers)
+	}
+	return &http.Client{
+		Transport: &http.Transport{
+			Proxy:               http.ProxyFromEnvironment,
+			MaxIdleConns:        idleConns,
+			MaxIdleConnsPerHost: idleConns,
+			IdleConnTimeout:     90 * time.Second,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+}
+
 func newRPCClient(rpcURL string, cookieFile string, rpcUser string, rpcPassword string) (*btcrpc.Client, error) {
 	opts := []btcrpc.Option{}
 	if cookieFile != "" {
@@ -183,9 +257,10 @@ func newRPCClient(rpcURL string, cookieFile string, rpcUser string, rpcPassword 
 }
 
 func printUsage() {
-	fmt.Fprintln(os.Stderr, "usage: fractal-block-sync <upload|submit> [flags]")
+	fmt.Fprintln(os.Stderr, "usage: fractal-block-sync <upload|submit|bench-download> [flags]")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "commands:")
 	fmt.Fprintln(os.Stderr, "  upload  upload raw blocks and stable range indexes to R2")
 	fmt.Fprintln(os.Stderr, "  submit  download, verify, and submit the next missing block")
+	fmt.Fprintln(os.Stderr, "  bench-download  download blocks from R2 without submitting them")
 }

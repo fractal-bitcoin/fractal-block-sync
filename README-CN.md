@@ -76,6 +76,20 @@ BOOTSTRAP_FROM_R2=true docker compose --profile submit up --build
 --bootstrap-from-r2
 ```
 
+## 下载性能测试
+
+只测试公开 R2 下载吞吐，不连接节点，也不提交区块：
+
+```bash
+./fractal-block-sync bench-download \
+  --base-url https://<public-r2-domain> \
+  --from-height 100000 \
+  --to-height 200000 \
+  --workers 32
+```
+
+如果不传 `--to-height`，程序会持续向后遍历，直到遇到下一个缺失的 range index。
+
 ## RPC 认证
 
 二选一：

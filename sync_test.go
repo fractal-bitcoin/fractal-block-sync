@@ -369,11 +369,14 @@ func (f *fakeSubmitRPC) SubmitBlock(ctx context.Context, blockHex string) (strin
 }
 
 type fakeDownloader struct {
+	mu      sync.Mutex
 	objects map[string][]byte
 	blocks  map[string][]byte
 }
 
 func (f *fakeDownloader) DownloadObject(ctx context.Context, key string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	data, ok := f.objects[key]
 	if !ok {
 		return nil, r2store.ErrNotFound
@@ -382,11 +385,89 @@ func (f *fakeDownloader) DownloadObject(ctx context.Context, key string) ([]byte
 }
 
 func (f *fakeDownloader) DownloadBlock(ctx context.Context, hash string) ([]byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	data, ok := f.blocks[hash]
 	if !ok {
 		return nil, errors.New("missing block")
 	}
 	return append([]byte(nil), data...), nil
+}
+
+func TestBenchDownloadDownloadsBlocksInRange(t *testing.T) {
+	hashes := []string{
+		fmt.Sprintf("%064x", 1),
+		fmt.Sprintf("%064x", 2),
+		fmt.Sprintf("%064x", 3),
+	}
+	bin, err := rangeindex.Encode(hashes, 3)
+	if err != nil {
+		t.Fatalf("Encode returned error: %v", err)
+	}
+	downloader := &fakeDownloader{
+		objects: map[string][]byte{"index/range/v1/size-3/0000000000.bin": bin},
+		blocks: map[string][]byte{
+			hashes[0]: []byte("aa"),
+			hashes[1]: []byte("bbb"),
+			hashes[2]: []byte("cccc"),
+		},
+	}
+	toHeight := uint64(2)
+
+	result, err := BenchDownload(context.Background(), downloader, BenchDownloadConfig{
+		RangeSize: 3,
+		ToHeight:  &toHeight,
+		Workers:   2,
+	})
+	if err != nil {
+		t.Fatalf("BenchDownload returned error: %v", err)
+	}
+	if result.DownloadedBlocks != 3 || result.DownloadedBytes != 9 || result.FailedBlocks != 0 || result.LastHeight != 2 {
+		t.Fatalf("result = %+v, want 3 blocks, 9 bytes, last height 2", result)
+	}
+}
+
+func TestBenchDownloadStopsAtMissingRangeIndexWithoutToHeight(t *testing.T) {
+	hashes := []string{
+		fmt.Sprintf("%064x", 1),
+		fmt.Sprintf("%064x", 2),
+	}
+	bin, err := rangeindex.Encode(hashes, 2)
+	if err != nil {
+		t.Fatalf("Encode returned error: %v", err)
+	}
+	downloader := &fakeDownloader{
+		objects: map[string][]byte{"index/range/v1/size-2/0000000000.bin": bin},
+		blocks: map[string][]byte{
+			hashes[0]: []byte("a"),
+			hashes[1]: []byte("b"),
+		},
+	}
+
+	result, err := BenchDownload(context.Background(), downloader, BenchDownloadConfig{
+		RangeSize: 2,
+		Workers:   1,
+	})
+	if err != nil {
+		t.Fatalf("BenchDownload returned error: %v", err)
+	}
+	if result.DownloadedBlocks != 2 || result.LastHeight != 1 {
+		t.Fatalf("result = %+v, want stop after first range", result)
+	}
+}
+
+func TestBenchDownloadErrorsAtMissingRangeIndexWithToHeight(t *testing.T) {
+	downloader := &fakeDownloader{}
+	toHeight := uint64(2)
+
+	_, err := BenchDownload(context.Background(), downloader, BenchDownloadConfig{
+		RangeSize: 2,
+		ToHeight:  &toHeight,
+		Workers:   1,
+	})
+	if !errors.Is(err, r2store.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
+	}
 }
 
 func TestSubmitNextUsesRangeIndex(t *testing.T) {

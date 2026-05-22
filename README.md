@@ -78,6 +78,22 @@ Binary flag:
 --bootstrap-from-r2
 ```
 
+## Download Benchmark
+
+Measure public R2 download throughput without connecting to or submitting blocks
+to a node:
+
+```bash
+./fractal-block-sync bench-download \
+  --base-url https://<public-r2-domain> \
+  --from-height 100000 \
+  --to-height 200000 \
+  --workers 32
+```
+
+If `--to-height` is omitted, the benchmark keeps walking forward and stops when
+the next range index is missing.
+
 ## Authentication
 
 Use one of:

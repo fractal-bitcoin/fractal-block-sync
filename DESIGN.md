@@ -283,6 +283,42 @@ Submit algorithm for the next missing block:
    ```
 10. Continue if the RPC result is `null` or an already-known style result.
 
+## Download Benchmark Flow
+
+Benchmark command:
+
+```bash
+fractal-block-sync bench-download \
+  --base-url https://test-fractal-blocks.fractalbitcoin.io \
+  --from-height 100000 \
+  --to-height 200000 \
+  --workers 32
+```
+
+The benchmark does not connect to a local node and does not call `submitblock`.
+It measures public R2 read throughput by walking range indexes and downloading
+block objects.
+
+Benchmark algorithm:
+
+1. Start at `from_height`.
+2. Download the range bin containing the current height:
+   ```text
+   GET /index/range/v1/size-2500/{start_height}.bin
+   ```
+3. Read each target block hash from the range bin.
+4. Dispatch block download jobs to parallel workers:
+   ```text
+   GET /blocks/{hash}.blk
+   ```
+5. Track downloaded blocks, failed blocks, total bytes, MiB/s, and blocks/s.
+6. If `to_height` is set, stop after that height.
+7. If `to_height` is not set, keep walking forward until the next range bin
+   returns 404.
+
+The benchmark intentionally does not calculate block hashes by default, so the
+reported throughput is dominated by R2 and network download performance.
+
 ## No Manifest
 
 The client does not need a global provider metadata object, and the provider does
