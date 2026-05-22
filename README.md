@@ -29,8 +29,6 @@ SECRET_ACCESS_KEY="<r2-secret-access-key>" \
 BUCKET_NAME="<bucket-name>" \
 RPC_URL="http://host.docker.internal:8332" \
 BITCOIN_COOKIE_FILE="$HOME/.bitcoin/.cookie" \
-RANGE_SIZE=2880 \
-STABLE_DELAY=2880 \
 docker compose --profile upload up --build
 ```
 
@@ -44,8 +42,6 @@ BUCKET_NAME="<bucket-name>" \
 ./fractal-block-sync upload \
   --rpc-url http://127.0.0.1:8332 \
   --cookie-file ~/.bitcoin/.cookie \
-  --range-size 2880 \
-  --stable-delay 2880 \
   --follow
 ```
 
@@ -57,7 +53,6 @@ Docker Compose:
 BASE_URL="https://<public-r2-domain>" \
 RPC_URL="http://host.docker.internal:8332" \
 BITCOIN_COOKIE_FILE="$HOME/.bitcoin/.cookie" \
-RANGE_SIZE=2880 \
 docker compose --profile submit up --build
 ```
 
@@ -68,7 +63,6 @@ Binary:
   --base-url https://<public-r2-domain> \
   --rpc-url http://127.0.0.1:8332 \
   --cookie-file ~/.bitcoin/.cookie \
-  --range-size 2880 \
   --follow
 ```
 
@@ -104,8 +98,7 @@ SECRET_ACCESS_KEY R2 secret key
 BUCKET_NAME       R2 bucket
 FROM_HEIGHT       height whose range should be checked first, default 0
 TO_HEIGHT         last height to upload, inclusive; empty means current tip
-RANGE_SIZE        range index size, default 2880
-STABLE_DELAY      blocks near tip excluded from range indexes, default 2880
+STABLE_DELAY      blocks near tip excluded from range indexes, default 2500
 UPLOAD_WORKERS    parallel upload workers, default 4
 UPLOAD_INTERVAL   polling interval, default 30s
 ```
@@ -114,13 +107,12 @@ Submit environment variables:
 
 ```text
 BASE_URL           public R2 download URL
-RANGE_SIZE         must match uploader
-RECENT_WALK_LIMIT  local header walk limit, default 2880
+RECENT_WALK_LIMIT  local header walk limit, default 2500
 BOOTSTRAP_FROM_R2  use R2 indexes when local headers are unavailable
 SUBMIT_INTERVAL    polling interval, default 10s
 ```
 
-For CLI usage, use the equivalent kebab-case flags, for example `RANGE_SIZE` -> `--range-size`.
+For CLI usage, use the equivalent kebab-case flags, for example `FROM_HEIGHT` -> `--from-height`.
 
 ## R2 Layout
 
@@ -137,10 +129,9 @@ stableTip = localTip - STABLE_DELAY
 
 ## Test Chain
 
-For small test chains, use the same small range on uploader and submitter:
+For small test chains, reduce the stable delay and enable R2 bootstrap:
 
 ```bash
-RANGE_SIZE=100
 STABLE_DELAY=0
 BOOTSTRAP_FROM_R2=true
 ```
@@ -148,7 +139,7 @@ BOOTSTRAP_FROM_R2=true
 Check an index:
 
 ```bash
-curl -I "$BASE_URL/index/range/v1/size-100/0000000000.bin"
+curl -I "$BASE_URL/index/range/v1/size-2500/0000000000.bin"
 ```
 
 ## Testing

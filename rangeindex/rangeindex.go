@@ -8,7 +8,7 @@ import (
 
 const (
 	HashSize         = 32
-	DefaultRangeSize = 2880
+	DefaultRangeSize = 2500
 )
 
 // StartHeight returns the first height covered by the range containing height.

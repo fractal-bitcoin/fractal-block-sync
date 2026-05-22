@@ -18,8 +18,8 @@ import (
 
 const (
 	DefaultRangeSize       = rangeindex.DefaultRangeSize
-	DefaultStableDelay     = 2880
-	DefaultRecentWalkLimit = 2880
+	DefaultStableDelay     = 2500
+	DefaultRecentWalkLimit = 2500
 	DefaultUploadWorkers   = 4
 )
 

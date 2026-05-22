@@ -42,7 +42,7 @@ blocks/{hash}.blk
 Historical range index object:
 
 ```text
-index/range/v1/size-2880/{start_height}.bin
+index/range/v1/size-2500/{start_height}.bin
 ```
 
 Range index objects also act as provider completion markers. If a range bin
@@ -52,9 +52,9 @@ objects.
 Examples:
 
 ```text
-index/range/v1/size-2880/0000000000.bin
-index/range/v1/size-2880/0000002880.bin
-index/range/v1/size-2880/0000005760.bin
+index/range/v1/size-2500/0000000000.bin
+index/range/v1/size-2500/0000002500.bin
+index/range/v1/size-2500/0000005000.bin
 ```
 
 The range start height is:
@@ -66,9 +66,9 @@ start_height = height / range_size * range_size
 Default values:
 
 ```text
-range_size = 2880
-stable_delay = 2880
-recent_walk_limit = 2880
+range_size = 2500
+stable_delay = 2500
+recent_walk_limit = 2500
 ```
 
 ## Range Bin Format
@@ -78,7 +78,7 @@ Each range bin contains exactly `range_size` hashes.
 Default byte size:
 
 ```text
-2880 * 32 = 92160 bytes
+2500 * 32 = 80000 bytes
 ```
 
 Binary layout:
@@ -115,9 +115,8 @@ fractal-block-sync upload \
   --rpc-url http://127.0.0.1:8332 \
   --cookie-file ~/.bitcoin/.cookie \
   --from-height 0 \
-  --to-height 57599 \
-  --range-size 2880 \
-  --stable-delay 2880 \
+  --to-height 4999 \
+  --stable-delay 2500 \
   --follow
 ```
 
@@ -144,7 +143,6 @@ Docker environment variables additionally expose:
 ```text
 FROM_HEIGHT
 TO_HEIGHT
-RANGE_SIZE
 STABLE_DELAY
 UPLOAD_WORKERS
 UPLOAD_INTERVAL
@@ -169,7 +167,7 @@ Upload algorithm:
 4. For each range:
    - HEAD the range bin:
      ```text
-     index/range/v1/size-2880/{start_height}.bin
+     index/range/v1/size-2500/{start_height}.bin
      ```
    - If it exists, skip the whole range.
    - If it does not exist, process heights in the range up to `end_height`.
@@ -186,7 +184,7 @@ Upload algorithm:
    ```
 7. Once all blocks in a complete stable range are available, upload:
    ```text
-   index/range/v1/size-2880/{start_height}.bin
+   index/range/v1/size-2500/{start_height}.bin
    ```
 8. Do not create range indexes for incomplete ranges or the latest
    `stable_delay` blocks.
@@ -218,12 +216,12 @@ then creates the range bin once the range is complete and stable.
 
 Multiple uploaders can work on different height shards by setting non-overlapping
 `FROM_HEIGHT` and `TO_HEIGHT` ranges. Operators should align shard boundaries to
-`RANGE_SIZE` where practical:
+the 2500-block range size where practical:
 
 ```text
-FROM_HEIGHT=0      TO_HEIGHT=57599
-FROM_HEIGHT=57600  TO_HEIGHT=115199
-FROM_HEIGHT=115200 TO_HEIGHT=172799
+FROM_HEIGHT=0      TO_HEIGHT=4999
+FROM_HEIGHT=5000  TO_HEIGHT=9999
+FROM_HEIGHT=10000 TO_HEIGHT=14999
 ```
 
 If shards overlap, correctness is preserved by hash-addressed block objects,
@@ -239,8 +237,7 @@ fractal-block-sync submit \
   --base-url https://test-fractal-blocks.fractalbitcoin.io \
   --rpc-url http://127.0.0.1:8332 \
   --cookie-file ~/.bitcoin/.cookie \
-  --range-size 2880 \
-  --recent-walk-limit 2880 \
+  --recent-walk-limit 2500 \
   --follow
 ```
 
@@ -265,7 +262,7 @@ Submit algorithm for the next missing block:
    P2P.
 4. Try the historical range index first:
    ```text
-   GET /index/range/v1/size-2880/{start_height}.bin
+   GET /index/range/v1/size-2500/{start_height}.bin
    ```
 5. If the range bin exists:
    - Read the target hash from the fixed offset.

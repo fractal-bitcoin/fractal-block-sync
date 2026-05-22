@@ -55,7 +55,6 @@ func runUpload(ctx context.Context, args []string) error {
 	rpcPassword := flags.String("rpc-password", "", "bitcoind RPC password")
 	fromHeight := flags.Uint64("from-height", 0, "height whose range should be checked first")
 	toHeightText := flags.String("to-height", "", "last height to upload, inclusive")
-	rangeSize := flags.Uint64("range-size", blocksync.DefaultRangeSize, "range index size")
 	stableDelay := flags.Uint64("stable-delay", blocksync.DefaultStableDelay, "stable block delay before publishing range indexes")
 	uploadWorkers := flags.Uint("upload-workers", blocksync.DefaultUploadWorkers, "parallel block upload workers")
 	follow := flags.Bool("follow", false, "keep polling and uploading")
@@ -89,7 +88,6 @@ func runUpload(ctx context.Context, args []string) error {
 	cfg := blocksync.UploadConfig{
 		FromHeight:    *fromHeight,
 		ToHeight:      toHeight,
-		RangeSize:     *rangeSize,
 		StableDelay:   *stableDelay,
 		UploadWorkers: *uploadWorkers,
 		Logger:        logger,
@@ -125,7 +123,6 @@ func runSubmit(ctx context.Context, args []string) error {
 	cookieFile := flags.String("cookie-file", "", "bitcoind cookie file")
 	rpcUser := flags.String("rpc-user", "", "bitcoind RPC username")
 	rpcPassword := flags.String("rpc-password", "", "bitcoind RPC password")
-	rangeSize := flags.Uint64("range-size", blocksync.DefaultRangeSize, "range index size")
 	recentWalkLimit := flags.Uint64("recent-walk-limit", blocksync.DefaultRecentWalkLimit, "maximum recent header walk")
 	bootstrapFromR2 := flags.Bool("bootstrap-from-r2", false, "submit using R2 range indexes when local headers are unavailable")
 	follow := flags.Bool("follow", false, "keep submitting as headers arrive")
@@ -145,7 +142,6 @@ func runSubmit(ctx context.Context, args []string) error {
 
 	logger := log.New(os.Stderr, "", log.LstdFlags)
 	cfg := blocksync.SubmitConfig{
-		RangeSize:       *rangeSize,
 		RecentWalkLimit: *recentWalkLimit,
 		BootstrapFromR2: *bootstrapFromR2,
 		Logger:          logger,

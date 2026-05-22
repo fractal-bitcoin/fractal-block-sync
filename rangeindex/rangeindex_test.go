@@ -7,14 +7,14 @@ import (
 )
 
 func TestObjectKeyForHeight(t *testing.T) {
-	key, startHeight, err := ObjectKeyForHeight(5761, 2880)
+	key, startHeight, err := ObjectKeyForHeight(5761, 2500)
 	if err != nil {
 		t.Fatalf("ObjectKeyForHeight returned error: %v", err)
 	}
-	if startHeight != 5760 {
-		t.Fatalf("startHeight = %d, want 5760", startHeight)
+	if startHeight != 5000 {
+		t.Fatalf("startHeight = %d, want 5000", startHeight)
 	}
-	wantKey := "index/range/v1/size-2880/0000005760.bin"
+	wantKey := "index/range/v1/size-2500/0000005000.bin"
 	if key != wantKey {
 		t.Fatalf("key = %q, want %q", key, wantKey)
 	}

@@ -38,8 +38,7 @@ services:
       BITCOIN_COOKIE_FILE: ${BITCOIN_COOKIE_FILE:-}
       FROM_HEIGHT: ${FROM_HEIGHT:-0}
       TO_HEIGHT: ${TO_HEIGHT:-}
-      RANGE_SIZE: ${RANGE_SIZE:-2880}
-      STABLE_DELAY: ${STABLE_DELAY:-2880}
+      STABLE_DELAY: ${STABLE_DELAY:-2500}
       UPLOAD_WORKERS: ${UPLOAD_WORKERS:-4}
       UPLOAD_INTERVAL: ${UPLOAD_INTERVAL:-30s}
     entrypoint:
@@ -50,7 +49,6 @@ services:
         set -- upload \
           --rpc-url "$${RPC_URL}" \
           --from-height "$${FROM_HEIGHT}" \
-          --range-size "$${RANGE_SIZE}" \
           --stable-delay "$${STABLE_DELAY}" \
           --upload-workers "$${UPLOAD_WORKERS}" \
           --interval "$${UPLOAD_INTERVAL}" \
@@ -77,8 +75,7 @@ services:
       RPC_USER: ${RPC_USER:-}
       RPC_PASSWORD: ${RPC_PASSWORD:-}
       BITCOIN_COOKIE_FILE: ${BITCOIN_COOKIE_FILE:-}
-      RANGE_SIZE: ${RANGE_SIZE:-2880}
-      RECENT_WALK_LIMIT: ${RECENT_WALK_LIMIT:-2880}
+      RECENT_WALK_LIMIT: ${RECENT_WALK_LIMIT:-2500}
       BOOTSTRAP_FROM_R2: ${BOOTSTRAP_FROM_R2:-false}
       SUBMIT_INTERVAL: ${SUBMIT_INTERVAL:-10s}
     entrypoint:
@@ -89,7 +86,6 @@ services:
         set -- submit \
           --base-url "$${BASE_URL}" \
           --rpc-url "$${RPC_URL}" \
-          --range-size "$${RANGE_SIZE}" \
           --recent-walk-limit "$${RECENT_WALK_LIMIT}" \
           --interval "$${SUBMIT_INTERVAL}" \
           --follow
