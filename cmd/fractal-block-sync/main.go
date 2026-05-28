@@ -19,6 +19,11 @@ import (
 
 const defaultRPCURL = "http://127.0.0.1:8332"
 
+const (
+	uploadFollowIdleInterval = time.Second
+	uploadFollowWaitLogEvery = time.Minute
+)
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -61,7 +66,6 @@ func runUpload(ctx context.Context, args []string) error {
 	stableDelay := flags.Uint64("stable-delay", blocksync.DefaultStableDelay, "stable block delay before publishing range indexes")
 	uploadWorkers := flags.Uint("upload-workers", blocksync.DefaultUploadWorkers, "parallel block upload workers")
 	follow := flags.Bool("follow", false, "keep polling and uploading")
-	interval := flags.Duration("interval", 30*time.Second, "follow polling interval")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -95,27 +99,39 @@ func runUpload(ctx context.Context, args []string) error {
 		UploadWorkers: *uploadWorkers,
 		Logger:        logger,
 	}
-	for {
-		if err := blocksync.UploadOnce(ctx, rpcClient, writer, cfg); err != nil {
-			if !*follow {
-				return err
+	if *follow {
+		follower, err := blocksync.NewUploadFollower(rpcClient, writer, cfg)
+		if err != nil {
+			return err
+		}
+		var lastWaitLog time.Time
+		for {
+			result, err := follower.UploadOnce(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				logger.Printf("upload failed: %v", err)
+				if err := blocksync.SleepOrDone(ctx, uploadFollowIdleInterval); err != nil {
+					return nil
+				}
+				continue
 			}
-			if ctx.Err() != nil {
+			if result.HasWork() {
+				lastWaitLog = time.Time{}
+				continue
+			}
+			now := time.Now()
+			if lastWaitLog.IsZero() || now.Sub(lastWaitLog) >= uploadFollowWaitLogEvery {
+				logger.Printf("waiting for new blocks tip=%d next_index_start=%d interval=%s", result.Tip, result.NextIndexStart, uploadFollowIdleInterval)
+				lastWaitLog = now
+			}
+			if err := blocksync.SleepOrDone(ctx, uploadFollowIdleInterval); err != nil {
 				return nil
 			}
-			logger.Printf("upload failed: %v", err)
-			if err := blocksync.SleepOrDone(ctx, *interval); err != nil {
-				return nil
-			}
-			continue
-		}
-		if !*follow {
-			return nil
-		}
-		if err := blocksync.SleepOrDone(ctx, *interval); err != nil {
-			return nil
 		}
 	}
+	return blocksync.UploadOnce(ctx, rpcClient, writer, cfg)
 }
 
 func runSubmit(ctx context.Context, args []string) error {

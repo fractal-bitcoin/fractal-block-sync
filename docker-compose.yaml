@@ -40,7 +40,6 @@ services:
       TO_HEIGHT: ${TO_HEIGHT:-}
       STABLE_DELAY: ${STABLE_DELAY:-2500}
       UPLOAD_WORKERS: ${UPLOAD_WORKERS:-4}
-      UPLOAD_INTERVAL: ${UPLOAD_INTERVAL:-30s}
     entrypoint:
       - /bin/sh
       - -ec
@@ -51,7 +50,6 @@ services:
           --from-height "$${FROM_HEIGHT}" \
           --stable-delay "$${STABLE_DELAY}" \
           --upload-workers "$${UPLOAD_WORKERS}" \
-          --interval "$${UPLOAD_INTERVAL}" \
           --follow
         if [ -n "$${TO_HEIGHT:-}" ]; then
           set -- "$$@" --to-height "$${TO_HEIGHT}"

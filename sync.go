@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"fractal-block-sync/blockhash"
@@ -49,6 +50,26 @@ type UploadConfig struct {
 	StableDelay   uint64
 	UploadWorkers uint
 	Logger        *log.Logger
+}
+
+// ErrUploadReorgTouchesPublishedIndex indicates that a local reorg would
+// invalidate an already published range index.
+var ErrUploadReorgTouchesPublishedIndex = errors.New("upload reorg touches published range index")
+
+// UploadFollowResult describes one stateful follow upload attempt.
+type UploadFollowResult struct {
+	Tip              uint64
+	LastTip          uint64
+	NextIndexStart   uint64
+	UploadedBlocks   uint64
+	PublishedIndexes uint64
+	Waiting          bool
+}
+
+// HasWork reports whether the attempt made upload progress or observed chain
+// progress that should be followed immediately.
+func (r UploadFollowResult) HasWork() bool {
+	return r.Tip != r.LastTip || r.UploadedBlocks > 0 || r.PublishedIndexes > 0
 }
 
 // UploadOnce uploads blocks from the range containing FromHeight to the current
@@ -115,11 +136,11 @@ func UploadOnce(ctx context.Context, rpc BlockProvider, writer ObjectWriter, cfg
 			continue
 		}
 
-		if err := uploadBlocks(ctx, rpc, writer, start, end, uploadWorkers, cfg.Logger); err != nil {
+		if _, err := uploadBlocks(ctx, rpc, writer, start, end, uploadWorkers, cfg.Logger); err != nil {
 			return err
 		}
 		if rangeEnd <= endHeight && hasStableTip && rangeEnd <= stableTip {
-			if err := uploadRangeIndexIfMissing(ctx, rpc, writer, start, rangeSize, cfg.Logger); err != nil {
+			if _, err := uploadRangeIndexIfMissing(ctx, rpc, writer, start, rangeSize, cfg.Logger); err != nil {
 				return err
 			}
 		}
@@ -131,6 +152,389 @@ func UploadOnce(ctx context.Context, rpc BlockProvider, writer ObjectWriter, cfg
 	return nil
 }
 
+// UploadFollower keeps in-process upload state for efficient follow mode.
+type UploadFollower struct {
+	rpc    BlockProvider
+	writer ObjectWriter
+	cfg    UploadConfig
+
+	rangeSize     uint64
+	stableDelay   uint64
+	uploadWorkers uint
+	managedStart  uint64
+
+	initialized    bool
+	lastTip        uint64
+	nextIndexStart uint64
+	recentHashes   map[uint64]string
+}
+
+type uploadFollowerStats struct {
+	uploadedBlocks   uint64
+	publishedIndexes uint64
+}
+
+// NewUploadFollower creates a stateful uploader for follow mode.
+func NewUploadFollower(rpc BlockProvider, writer ObjectWriter, cfg UploadConfig) (*UploadFollower, error) {
+	rangeSize := cfg.RangeSize
+	if rangeSize == 0 {
+		rangeSize = DefaultRangeSize
+	}
+	managedStart, err := rangeindex.StartHeight(cfg.FromHeight, rangeSize)
+	if err != nil {
+		return nil, err
+	}
+	uploadWorkers := cfg.UploadWorkers
+	if uploadWorkers == 0 {
+		uploadWorkers = DefaultUploadWorkers
+	}
+	return &UploadFollower{
+		rpc:            rpc,
+		writer:         writer,
+		cfg:            cfg,
+		rangeSize:      rangeSize,
+		stableDelay:    cfg.StableDelay,
+		uploadWorkers:  uploadWorkers,
+		managedStart:   managedStart,
+		nextIndexStart: managedStart,
+		recentHashes:   map[uint64]string{},
+	}, nil
+}
+
+// UploadOnce uploads the current increment and advances stable range indexes.
+func (f *UploadFollower) UploadOnce(ctx context.Context) (UploadFollowResult, error) {
+	result := UploadFollowResult{
+		LastTip:        f.lastTip,
+		NextIndexStart: f.nextIndexStart,
+	}
+	localTip, err := f.rpc.GetBlockCount(ctx)
+	if err != nil {
+		return result, fmt.Errorf("get block count: %w", err)
+	}
+	endHeight := f.endHeight(localTip)
+	result.Tip = endHeight
+	if f.cfg.FromHeight > endHeight {
+		return f.finishResult(result), nil
+	}
+
+	var stats uploadFollowerStats
+	if !f.initialized {
+		stats, err = f.initialize(ctx, localTip, endHeight)
+		if err != nil {
+			return result, err
+		}
+	} else {
+		if err := f.ensurePublishedBoundaryVisible(endHeight); err != nil {
+			return result, err
+		}
+		stats, err = f.uploadIncrement(ctx, endHeight)
+		if err != nil {
+			return result, err
+		}
+		indexStats, err := f.publishStableIndexes(ctx, localTip, endHeight)
+		if err != nil {
+			return result, err
+		}
+		stats.uploadedBlocks += indexStats.uploadedBlocks
+		stats.publishedIndexes += indexStats.publishedIndexes
+	}
+	result.UploadedBlocks = stats.uploadedBlocks
+	result.PublishedIndexes = stats.publishedIndexes
+	return f.finishResult(result), nil
+}
+
+func (f *UploadFollower) finishResult(result UploadFollowResult) UploadFollowResult {
+	result.NextIndexStart = f.nextIndexStart
+	result.Waiting = !result.HasWork()
+	return result
+}
+
+func (f *UploadFollower) endHeight(localTip uint64) uint64 {
+	endHeight := localTip
+	if f.cfg.ToHeight != nil && *f.cfg.ToHeight < endHeight {
+		endHeight = *f.cfg.ToHeight
+	}
+	return endHeight
+}
+
+func (f *UploadFollower) initialize(ctx context.Context, localTip uint64, endHeight uint64) (uploadFollowerStats, error) {
+	var stats uploadFollowerStats
+	f.nextIndexStart = f.managedStart
+	f.recentHashes = map[uint64]string{}
+
+	uploadStart, err := f.findInitialUploadStart(ctx, endHeight)
+	if err != nil {
+		return stats, err
+	}
+	if err := f.ensurePublishedBoundaryVisible(endHeight); err != nil {
+		return stats, err
+	}
+	if uploadStart <= endHeight {
+		uploaded, err := uploadBlocks(ctx, f.rpc, f.writer, uploadStart, endHeight, f.uploadWorkers, f.cfg.Logger)
+		if err != nil {
+			return stats, err
+		}
+		stats.uploadedBlocks += uploaded
+	}
+	indexStats, err := f.publishStableIndexes(ctx, localTip, endHeight)
+	if err != nil {
+		return stats, err
+	}
+	stats.uploadedBlocks += indexStats.uploadedBlocks
+	stats.publishedIndexes += indexStats.publishedIndexes
+	if err := f.refreshRecentHashes(ctx, f.recentCacheStart(endHeight), endHeight); err != nil {
+		return stats, err
+	}
+	f.lastTip = endHeight
+	f.initialized = true
+	return stats, nil
+}
+
+func (f *UploadFollower) findInitialUploadStart(ctx context.Context, endHeight uint64) (uint64, error) {
+	for f.nextIndexStart <= endHeight {
+		key, err := rangeindex.ObjectKey(f.nextIndexStart, f.rangeSize)
+		if err != nil {
+			return 0, err
+		}
+		exists, err := f.writer.ObjectExists(ctx, key)
+		if err != nil {
+			return 0, fmt.Errorf("check range index %s: %w", key, err)
+		}
+		if !exists {
+			break
+		}
+		if f.cfg.Logger != nil {
+			f.cfg.Logger.Printf("skipped existing range index start=%d key=%s", f.nextIndexStart, key)
+		}
+		next, ok := nextRangeStart(f.nextIndexStart, f.rangeSize)
+		if !ok {
+			return f.nextIndexStart, nil
+		}
+		f.nextIndexStart = next
+	}
+	return f.nextIndexStart, nil
+}
+
+func (f *UploadFollower) ensurePublishedBoundaryVisible(endHeight uint64) error {
+	boundary, ok := f.publishedBoundary()
+	if !ok || endHeight >= boundary {
+		return nil
+	}
+	return fmt.Errorf("%w: tip_height=%d published_boundary=%d next_index_start=%d", ErrUploadReorgTouchesPublishedIndex, endHeight, boundary, f.nextIndexStart)
+}
+
+func (f *UploadFollower) publishedBoundary() (uint64, bool) {
+	if f.nextIndexStart <= f.managedStart {
+		return 0, false
+	}
+	return f.nextIndexStart - 1, true
+}
+
+func nextRangeStart(start uint64, rangeSize uint64) (uint64, bool) {
+	if start > ^uint64(0)-rangeSize {
+		return 0, false
+	}
+	return start + rangeSize, true
+}
+
+func (f *UploadFollower) uploadIncrement(ctx context.Context, endHeight uint64) (uploadFollowerStats, error) {
+	var stats uploadFollowerStats
+	checkHeight := endHeight
+	if f.lastTip < checkHeight {
+		checkHeight = f.lastTip
+	}
+	if checkHeight < f.managedStart {
+		f.lastTip = endHeight
+		f.pruneRecentHashes(endHeight)
+		return stats, nil
+	}
+
+	currentHash, err := f.rpc.GetBlockHash(ctx, checkHeight)
+	if err != nil {
+		return stats, fmt.Errorf("get block hash at height %d: %w", checkHeight, err)
+	}
+	knownHash, ok := f.recentHashes[checkHeight]
+	if ok && knownHash == currentHash {
+		if endHeight > f.lastTip {
+			start := f.lastTip + 1
+			if start < f.managedStart {
+				start = f.managedStart
+			}
+			uploaded, err := uploadBlocksFrom(ctx, f.rpc, f.writer, start, endHeight, f.uploadWorkers, f.cfg.Logger)
+			if err != nil {
+				return stats, err
+			}
+			stats.uploadedBlocks += uploaded
+			if err := f.refreshRecentHashes(ctx, start, endHeight); err != nil {
+				return stats, err
+			}
+		}
+		f.lastTip = endHeight
+		f.pruneRecentHashes(endHeight)
+		return stats, nil
+	}
+
+	if !ok && checkHeight < f.nextIndexStart && f.nextIndexStart > f.managedStart {
+		return stats, fmt.Errorf("%w: height=%d next_index_start=%d", ErrUploadReorgTouchesPublishedIndex, checkHeight, f.nextIndexStart)
+	}
+	return f.uploadReorg(ctx, checkHeight, endHeight)
+}
+
+func (f *UploadFollower) uploadReorg(ctx context.Context, checkHeight uint64, endHeight uint64) (uploadFollowerStats, error) {
+	var stats uploadFollowerStats
+	if checkHeight < f.nextIndexStart && f.nextIndexStart > f.managedStart {
+		return stats, fmt.Errorf("%w: height=%d next_index_start=%d", ErrUploadReorgTouchesPublishedIndex, checkHeight, f.nextIndexStart)
+	}
+
+	ancestor, found, searchedPublishedBoundary, err := f.findCommonAncestor(ctx, checkHeight)
+	if err != nil {
+		return stats, err
+	}
+
+	var uploadStart uint64
+	if found {
+		if ancestor == ^uint64(0) {
+			return stats, fmt.Errorf("common ancestor overflow at height %d", ancestor)
+		}
+		uploadStart = ancestor + 1
+	} else {
+		if searchedPublishedBoundary {
+			return stats, fmt.Errorf("%w: no common ancestor before next_index_start=%d", ErrUploadReorgTouchesPublishedIndex, f.nextIndexStart)
+		}
+		uploadStart = f.nextIndexStart
+		if uploadStart < f.managedStart {
+			uploadStart = f.managedStart
+		}
+		if f.cfg.Logger != nil {
+			f.cfg.Logger.Printf("fallback upload from unpublished tail start=%d", uploadStart)
+		}
+	}
+
+	if uploadStart < f.nextIndexStart && f.nextIndexStart > f.managedStart {
+		return stats, fmt.Errorf("%w: upload_start=%d next_index_start=%d", ErrUploadReorgTouchesPublishedIndex, uploadStart, f.nextIndexStart)
+	}
+	if uploadStart <= endHeight {
+		uploaded, err := uploadBlocksFrom(ctx, f.rpc, f.writer, uploadStart, endHeight, f.uploadWorkers, f.cfg.Logger)
+		if err != nil {
+			return stats, err
+		}
+		stats.uploadedBlocks += uploaded
+	}
+	for height := range f.recentHashes {
+		if height >= uploadStart {
+			delete(f.recentHashes, height)
+		}
+	}
+	if uploadStart <= endHeight {
+		if err := f.refreshRecentHashes(ctx, uploadStart, endHeight); err != nil {
+			return stats, err
+		}
+	}
+	f.lastTip = endHeight
+	f.pruneRecentHashes(endHeight)
+	return stats, nil
+}
+
+func (f *UploadFollower) findCommonAncestor(ctx context.Context, startHeight uint64) (uint64, bool, bool, error) {
+	lowerBound := f.recentCacheStart(f.lastTip)
+	if startHeight < lowerBound {
+		lowerBound = startHeight
+	}
+	for height := startHeight; ; height-- {
+		knownHash, ok := f.recentHashes[height]
+		if ok {
+			currentHash, err := f.rpc.GetBlockHash(ctx, height)
+			if err != nil {
+				return 0, false, false, fmt.Errorf("get block hash at height %d: %w", height, err)
+			}
+			if currentHash == knownHash {
+				return height, true, false, nil
+			}
+		}
+		if height == lowerBound || height == 0 {
+			break
+		}
+	}
+	searchedPublishedBoundary := f.nextIndexStart > f.managedStart && lowerBound < f.nextIndexStart
+	return 0, false, searchedPublishedBoundary, nil
+}
+
+func (f *UploadFollower) publishStableIndexes(ctx context.Context, localTip uint64, endHeight uint64) (uploadFollowerStats, error) {
+	var stats uploadFollowerStats
+	if localTip < f.stableDelay {
+		return stats, nil
+	}
+	stableTip := localTip - f.stableDelay
+	for f.nextIndexStart <= endHeight {
+		rangeEnd := endOfRange(f.nextIndexStart, f.rangeSize)
+		if rangeEnd > endHeight || rangeEnd > stableTip {
+			break
+		}
+		uploaded, err := uploadBlocksFrom(ctx, f.rpc, f.writer, f.nextIndexStart, rangeEnd, f.uploadWorkers, f.cfg.Logger)
+		if err != nil {
+			return stats, err
+		}
+		stats.uploadedBlocks += uploaded
+		published, err := uploadRangeIndexIfMissing(ctx, f.rpc, f.writer, f.nextIndexStart, f.rangeSize, f.cfg.Logger)
+		if err != nil {
+			return stats, err
+		}
+		if published {
+			stats.publishedIndexes++
+		}
+		boundaryHash, err := f.rpc.GetBlockHash(ctx, rangeEnd)
+		if err != nil {
+			return stats, fmt.Errorf("get block hash at height %d: %w", rangeEnd, err)
+		}
+		f.recentHashes[rangeEnd] = boundaryHash
+		next, ok := nextRangeStart(f.nextIndexStart, f.rangeSize)
+		if !ok {
+			break
+		}
+		f.nextIndexStart = next
+		f.pruneRecentHashes(endHeight)
+	}
+	return stats, nil
+}
+
+func (f *UploadFollower) refreshRecentHashes(ctx context.Context, fromHeight uint64, toHeight uint64) error {
+	if fromHeight > toHeight {
+		return nil
+	}
+	for height := fromHeight; ; height++ {
+		hash, err := f.rpc.GetBlockHash(ctx, height)
+		if err != nil {
+			return fmt.Errorf("get block hash at height %d: %w", height, err)
+		}
+		f.recentHashes[height] = hash
+		if height == toHeight {
+			break
+		}
+	}
+	f.pruneRecentHashes(toHeight)
+	return nil
+}
+
+func (f *UploadFollower) recentCacheStart(endHeight uint64) uint64 {
+	start := f.managedStart
+	if f.nextIndexStart > f.managedStart {
+		start = f.nextIndexStart - 1
+	}
+	if endHeight < start {
+		return endHeight
+	}
+	return start
+}
+
+func (f *UploadFollower) pruneRecentHashes(endHeight uint64) {
+	start := f.recentCacheStart(endHeight)
+	for height := range f.recentHashes {
+		if height < start || height > endHeight {
+			delete(f.recentHashes, height)
+		}
+	}
+}
+
 func endOfRange(start uint64, rangeSize uint64) uint64 {
 	if start > ^uint64(0)-rangeSize+1 {
 		return ^uint64(0)
@@ -138,22 +542,22 @@ func endOfRange(start uint64, rangeSize uint64) uint64 {
 	return start + rangeSize - 1
 }
 
-func uploadRangeIndexIfMissing(ctx context.Context, rpc BlockProvider, writer ObjectWriter, start uint64, rangeSize uint64, logger *log.Logger) error {
+func uploadRangeIndexIfMissing(ctx context.Context, rpc BlockProvider, writer ObjectWriter, start uint64, rangeSize uint64, logger *log.Logger) (bool, error) {
 	key, err := rangeindex.ObjectKey(start, rangeSize)
 	if err != nil {
-		return err
+		return false, err
 	}
 	exists, err := writer.ObjectExists(ctx, key)
 	if err != nil {
-		return fmt.Errorf("check range index %s: %w", key, err)
+		return false, fmt.Errorf("check range index %s: %w", key, err)
 	}
 	if exists {
 		if logger != nil {
 			logger.Printf("skipped existing range index start=%d key=%s", start, key)
 		}
-		return nil
+		return false, nil
 	}
-	return uploadRangeIndex(ctx, rpc, writer, start, rangeSize, logger)
+	return true, uploadRangeIndex(ctx, rpc, writer, start, rangeSize, logger)
 }
 
 func uploadRangeIndex(ctx context.Context, rpc BlockProvider, writer ObjectWriter, start uint64, rangeSize uint64, logger *log.Logger) error {
@@ -182,13 +586,13 @@ func uploadRangeIndex(ctx context.Context, rpc BlockProvider, writer ObjectWrite
 	return nil
 }
 
-func uploadBlocks(ctx context.Context, rpc BlockProvider, writer ObjectWriter, fromHeight uint64, tip uint64, workers uint, logger *log.Logger) error {
+func uploadBlocks(ctx context.Context, rpc BlockProvider, writer ObjectWriter, fromHeight uint64, tip uint64, workers uint, logger *log.Logger) (uint64, error) {
 	if fromHeight > tip {
-		return nil
+		return 0, nil
 	}
 	uploadStart, err := findUploadStart(ctx, rpc, writer, fromHeight, tip, uploadMissingProbeStep, workers, logger)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	return uploadBlocksFrom(ctx, rpc, writer, uploadStart, tip, workers, logger)
 }
@@ -317,17 +721,22 @@ func finalUploadWindowStart(fromHeight uint64, tip uint64, window uint64) uint64
 	return tip - window + 1
 }
 
-func uploadBlocksFrom(ctx context.Context, rpc BlockProvider, writer ObjectWriter, fromHeight uint64, tip uint64, workers uint, logger *log.Logger) error {
+func uploadBlocksFrom(ctx context.Context, rpc BlockProvider, writer ObjectWriter, fromHeight uint64, tip uint64, workers uint, logger *log.Logger) (uint64, error) {
 	if workers <= 1 {
+		var uploaded uint64
 		for height := fromHeight; ; height++ {
-			if err := uploadBlock(ctx, rpc, writer, height, logger); err != nil {
-				return err
+			didUpload, err := uploadBlock(ctx, rpc, writer, height, logger)
+			if err != nil {
+				return uploaded, err
+			}
+			if didUpload {
+				uploaded++
 			}
 			if height == tip {
 				break
 			}
 		}
-		return nil
+		return uploaded, nil
 	}
 
 	uploadCtx, cancel := context.WithCancel(ctx)
@@ -335,19 +744,24 @@ func uploadBlocksFrom(ctx context.Context, rpc BlockProvider, writer ObjectWrite
 
 	jobs := make(chan uint64)
 	errs := make(chan error, 1)
+	var uploaded atomic.Uint64
 	var wg sync.WaitGroup
 	for worker := uint(0); worker < workers; worker++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for height := range jobs {
-				if err := uploadBlock(uploadCtx, rpc, writer, height, logger); err != nil {
+				didUpload, err := uploadBlock(uploadCtx, rpc, writer, height, logger)
+				if err != nil {
 					select {
 					case errs <- err:
 						cancel()
 					default:
 					}
 					return
+				}
+				if didUpload {
+					uploaded.Add(1)
 				}
 			}
 		}()
@@ -360,9 +774,9 @@ func uploadBlocksFrom(ctx context.Context, rpc BlockProvider, writer ObjectWrite
 			wg.Wait()
 			select {
 			case err := <-errs:
-				return err
+				return uploaded.Load(), err
 			default:
-				return uploadCtx.Err()
+				return uploaded.Load(), uploadCtx.Err()
 			}
 		case jobs <- height:
 		}
@@ -375,38 +789,38 @@ func uploadBlocksFrom(ctx context.Context, rpc BlockProvider, writer ObjectWrite
 
 	select {
 	case err := <-errs:
-		return err
+		return uploaded.Load(), err
 	default:
-		return nil
+		return uploaded.Load(), nil
 	}
 }
 
-func uploadBlock(ctx context.Context, rpc BlockProvider, writer ObjectWriter, height uint64, logger *log.Logger) error {
+func uploadBlock(ctx context.Context, rpc BlockProvider, writer ObjectWriter, height uint64, logger *log.Logger) (bool, error) {
 	hash, exists, err := getUploadBlockState(ctx, rpc, writer, height)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if exists {
 		if logger != nil {
 			logger.Printf("skipped existing block height=%d hash=%s", height, hash)
 		}
-		return nil
+		return false, nil
 	}
 	rawHex, err := rpc.GetBlockRawHex(ctx, hash)
 	if err != nil {
-		return fmt.Errorf("get raw block %s at height %d: %w", hash, height, err)
+		return false, fmt.Errorf("get raw block %s at height %d: %w", hash, height, err)
 	}
 	raw, err := hex.DecodeString(strings.TrimSpace(rawHex))
 	if err != nil {
-		return fmt.Errorf("decode raw block %s at height %d: %w", hash, height, err)
+		return false, fmt.Errorf("decode raw block %s at height %d: %w", hash, height, err)
 	}
 	if err := writer.UploadBlock(ctx, hash, raw); err != nil {
-		return fmt.Errorf("upload block %s at height %d: %w", hash, height, err)
+		return false, fmt.Errorf("upload block %s at height %d: %w", hash, height, err)
 	}
 	if logger != nil {
 		logger.Printf("uploaded block height=%d hash=%s", height, hash)
 	}
-	return nil
+	return true, nil
 }
 
 func getUploadBlockState(ctx context.Context, rpc BlockProvider, writer ObjectWriter, height uint64) (string, bool, error) {

@@ -27,6 +27,7 @@ type fakeUploadRPC struct {
 	active       int
 	maxActive    int
 	rawBlockGate chan struct{}
+	hashCalls    map[uint64]int
 }
 
 func (f *fakeUploadRPC) GetBlockCount(ctx context.Context) (uint64, error) {
@@ -34,6 +35,13 @@ func (f *fakeUploadRPC) GetBlockCount(ctx context.Context) (uint64, error) {
 }
 
 func (f *fakeUploadRPC) GetBlockHash(ctx context.Context, height uint64) (string, error) {
+	f.mu.Lock()
+	if f.hashCalls == nil {
+		f.hashCalls = map[uint64]int{}
+	}
+	f.hashCalls[height]++
+	f.mu.Unlock()
+
 	hash, ok := f.hashes[height]
 	if !ok {
 		return "", fmt.Errorf("missing hash %d", height)
@@ -71,6 +79,12 @@ func (f *fakeUploadRPC) GetBlockRawHex(ctx context.Context, hash string) (string
 		return "", fmt.Errorf("missing block %s", hash)
 	}
 	return rawHex, nil
+}
+
+func (f *fakeUploadRPC) hashCallCount(height uint64) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hashCalls[height]
 }
 
 type fakeWriter struct {
@@ -151,6 +165,13 @@ func makeUploadFixture(t *testing.T, count uint64) (map[uint64]string, map[strin
 		blocks[hash] = hex.EncodeToString([]byte{byte(height)})
 	}
 	return hashes, blocks
+}
+
+func setUploadFixtureBlock(hashes map[uint64]string, blocks map[string]string, height uint64, seed uint64) string {
+	hash := fmt.Sprintf("%064x", seed)
+	hashes[height] = hash
+	blocks[hash] = hex.EncodeToString([]byte{byte(seed)})
+	return hash
 }
 
 func TestUploadOnceUploadsBlocksAndStableRangeIndex(t *testing.T) {
@@ -438,6 +459,188 @@ func TestUploadOnceHonorsToHeight(t *testing.T) {
 	if _, ok := writer.index["index/range/v1/size-3/0000000000.bin"]; !ok {
 		t.Fatal("did not publish complete range ending at to-height")
 	}
+}
+
+func TestUploadFollowerUploadsOnlyNewBlocksAfterInitialSync(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 6)
+	rpc := &fakeUploadRPC{tip: 4, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+	follower, err := NewUploadFollower(rpc, writer, UploadConfig{RangeSize: 10, StableDelay: 100, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("NewUploadFollower returned error: %v", err)
+	}
+
+	mustUploadFollowerOnce(t, follower)
+	writer.events = nil
+	rpc.tip = 5
+
+	result := mustUploadFollowerOnce(t, follower)
+	if !result.HasWork() || result.Waiting || result.UploadedBlocks != 1 {
+		t.Fatalf("result = %+v, want one uploaded block and work", result)
+	}
+	if count := countEvents(writer.events, "head-block:"+hashes[5]); count != 1 {
+		t.Fatalf("new block head checks = %d, want 1, events=%v", count, writer.events)
+	}
+	for height := uint64(0); height < 5; height++ {
+		if count := countEvents(writer.events, "head-block:"+hashes[height]); count != 0 {
+			t.Fatalf("checked old block height %d %d times, events=%v", height, count, writer.events)
+		}
+	}
+	if _, ok := writer.blocks[hashes[5]]; !ok {
+		t.Fatal("did not upload new block")
+	}
+	if rpc.hashCallCount(4) == 0 {
+		t.Fatal("did not verify previous tip hash")
+	}
+}
+
+func TestUploadFollowerReportsWaitingWhenCaughtUp(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 3)
+	rpc := &fakeUploadRPC{tip: 2, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+	follower, err := NewUploadFollower(rpc, writer, UploadConfig{RangeSize: 10, StableDelay: 100, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("NewUploadFollower returned error: %v", err)
+	}
+	mustUploadFollowerOnce(t, follower)
+
+	result := mustUploadFollowerOnce(t, follower)
+	if !result.Waiting || result.HasWork() {
+		t.Fatalf("result = %+v, want waiting without work", result)
+	}
+	if result.Tip != 2 || result.LastTip != 2 {
+		t.Fatalf("result = %+v, want caught up at tip 2", result)
+	}
+}
+
+func TestUploadFollowerUploadsReorgedBlocksAndNewTip(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 11)
+	rpc := &fakeUploadRPC{tip: 9, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+	follower, err := NewUploadFollower(rpc, writer, UploadConfig{RangeSize: 20, StableDelay: 100, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("NewUploadFollower returned error: %v", err)
+	}
+	mustUploadFollowerOnce(t, follower)
+
+	reorgHashes := map[uint64]string{}
+	for height := uint64(5); height <= 10; height++ {
+		reorgHashes[height] = setUploadFixtureBlock(hashes, blocks, height, 1000+height)
+	}
+	writer.events = nil
+	rpc.tip = 10
+
+	result := mustUploadFollowerOnce(t, follower)
+	if !result.HasWork() || result.Waiting || result.UploadedBlocks != 6 {
+		t.Fatalf("result = %+v, want six reorg uploads and work", result)
+	}
+	for height := uint64(5); height <= 10; height++ {
+		hash := reorgHashes[height]
+		if _, ok := writer.blocks[hash]; !ok {
+			t.Fatalf("did not upload reorg block height %d hash %s", height, hash)
+		}
+		if count := countEvents(writer.events, "block:"+hash); count != 1 {
+			t.Fatalf("uploaded reorg block height %d %d times, events=%v", height, count, writer.events)
+		}
+	}
+	if count := countEvents(writer.events, "head-block:"+hashes[4]); count != 0 {
+		t.Fatalf("checked common ancestor block object %d times, events=%v", count, writer.events)
+	}
+}
+
+func TestUploadFollowerPublishesRangeIndexesIncrementally(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 8)
+	rpc := &fakeUploadRPC{tip: 4, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+	follower, err := NewUploadFollower(rpc, writer, UploadConfig{RangeSize: 3, StableDelay: 2, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("NewUploadFollower returned error: %v", err)
+	}
+	result := mustUploadFollowerOnce(t, follower)
+	if result.PublishedIndexes != 1 {
+		t.Fatalf("result = %+v, want one published index", result)
+	}
+	firstKey := "index/range/v1/size-3/0000000000.bin"
+	secondKey := "index/range/v1/size-3/0000000003.bin"
+	if _, ok := writer.index[firstKey]; !ok {
+		t.Fatal("did not publish first stable range")
+	}
+	if follower.nextIndexStart != 3 {
+		t.Fatalf("nextIndexStart = %d, want 3", follower.nextIndexStart)
+	}
+
+	writer.events = nil
+	rpc.tip = 7
+	result = mustUploadFollowerOnce(t, follower)
+	if result.PublishedIndexes != 1 {
+		t.Fatalf("result = %+v, want one published index", result)
+	}
+	if count := countEvents(writer.events, "head-object:"+firstKey); count != 0 {
+		t.Fatalf("rechecked first range index %d times, events=%v", count, writer.events)
+	}
+	if _, ok := writer.index[secondKey]; !ok {
+		t.Fatal("did not publish second stable range")
+	}
+	if follower.nextIndexStart != 6 {
+		t.Fatalf("nextIndexStart = %d, want 6", follower.nextIndexStart)
+	}
+}
+
+func TestUploadFollowerRejectsReorgTouchingPublishedIndex(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 6)
+	rpc := &fakeUploadRPC{tip: 5, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+	follower, err := NewUploadFollower(rpc, writer, UploadConfig{RangeSize: 3, StableDelay: 2, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("NewUploadFollower returned error: %v", err)
+	}
+	mustUploadFollowerOnce(t, follower)
+	if follower.nextIndexStart != 3 {
+		t.Fatalf("nextIndexStart = %d, want 3", follower.nextIndexStart)
+	}
+
+	reorgHash := setUploadFixtureBlock(hashes, blocks, 2, 2002)
+	for height := uint64(3); height <= 5; height++ {
+		setUploadFixtureBlock(hashes, blocks, height, 2000+height)
+	}
+	writer.events = nil
+
+	_, err = follower.UploadOnce(context.Background())
+	if !errors.Is(err, ErrUploadReorgTouchesPublishedIndex) {
+		t.Fatalf("err = %v, want ErrUploadReorgTouchesPublishedIndex", err)
+	}
+	if _, ok := writer.blocks[reorgHash]; ok {
+		t.Fatal("uploaded block from reorg touching published index")
+	}
+}
+
+func TestUploadFollowerRejectsTipBehindPublishedBoundary(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 6)
+	rpc := &fakeUploadRPC{tip: 5, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{}
+	follower, err := NewUploadFollower(rpc, writer, UploadConfig{RangeSize: 3, StableDelay: 2, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("NewUploadFollower returned error: %v", err)
+	}
+	mustUploadFollowerOnce(t, follower)
+
+	rpc.tip = 1
+	_, err = follower.UploadOnce(context.Background())
+	if !errors.Is(err, ErrUploadReorgTouchesPublishedIndex) {
+		t.Fatalf("err = %v, want ErrUploadReorgTouchesPublishedIndex", err)
+	}
+	if follower.lastTip != 5 {
+		t.Fatalf("lastTip = %d, want unchanged 5", follower.lastTip)
+	}
+}
+
+func mustUploadFollowerOnce(t *testing.T, follower *UploadFollower) UploadFollowResult {
+	t.Helper()
+	result, err := follower.UploadOnce(context.Background())
+	if err != nil {
+		t.Fatalf("UploadOnce returned error: %v", err)
+	}
+	return result
 }
 
 func indexOfEvent(events []string, want string) int {
