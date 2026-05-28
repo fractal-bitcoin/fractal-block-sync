@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -341,13 +342,24 @@ func countEvents(events []string, want string) int {
 }
 
 type fakeSubmitRPC struct {
-	info    btcrpc.BlockchainInfo
-	tips    []btcrpc.ChainTip
-	headers map[string]btcrpc.BlockHeader
-	submits []string
+	info            btcrpc.BlockchainInfo
+	infoCalls       int
+	infoSequence    []btcrpc.BlockchainInfo
+	tips            []btcrpc.ChainTip
+	headers         map[string]btcrpc.BlockHeader
+	submits         []string
+	submitHashes    []string
+	submitHashByHex map[string]string
+	submitErr       error
 }
 
 func (f *fakeSubmitRPC) GetBlockchainInfo(ctx context.Context) (btcrpc.BlockchainInfo, error) {
+	f.infoCalls++
+	if len(f.infoSequence) > 0 {
+		info := f.infoSequence[0]
+		f.infoSequence = f.infoSequence[1:]
+		return info, nil
+	}
 	return f.info, nil
 }
 
@@ -365,18 +377,30 @@ func (f *fakeSubmitRPC) GetBlockHeader(ctx context.Context, hash string) (btcrpc
 
 func (f *fakeSubmitRPC) SubmitBlock(ctx context.Context, blockHex string) (string, error) {
 	f.submits = append(f.submits, blockHex)
+	if f.submitHashByHex != nil {
+		f.submitHashes = append(f.submitHashes, f.submitHashByHex[blockHex])
+	}
+	if f.submitErr != nil {
+		return "", f.submitErr
+	}
 	return "", nil
 }
 
 type fakeDownloader struct {
-	mu      sync.Mutex
-	objects map[string][]byte
-	blocks  map[string][]byte
+	mu                sync.Mutex
+	objects           map[string][]byte
+	blocks            map[string][]byte
+	downloadedBlocks  []string
+	downloadedObjects []string
+	activeBlocks      int
+	maxActiveBlocks   int
+	blockGate         chan struct{}
 }
 
 func (f *fakeDownloader) DownloadObject(ctx context.Context, key string) ([]byte, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.downloadedObjects = append(f.downloadedObjects, key)
 	data, ok := f.objects[key]
 	if !ok {
 		return nil, r2store.ErrNotFound
@@ -386,7 +410,29 @@ func (f *fakeDownloader) DownloadObject(ctx context.Context, key string) ([]byte
 
 func (f *fakeDownloader) DownloadBlock(ctx context.Context, hash string) ([]byte, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
+	f.activeBlocks++
+	if f.activeBlocks > f.maxActiveBlocks {
+		f.maxActiveBlocks = f.activeBlocks
+	}
+	f.downloadedBlocks = append(f.downloadedBlocks, hash)
+	f.mu.Unlock()
+
+	if f.blockGate != nil {
+		select {
+		case <-ctx.Done():
+			f.mu.Lock()
+			f.activeBlocks--
+			f.mu.Unlock()
+			return nil, ctx.Err()
+		case <-f.blockGate:
+		}
+	}
+
+	f.mu.Lock()
+	defer func() {
+		f.activeBlocks--
+		f.mu.Unlock()
+	}()
 	data, ok := f.blocks[hash]
 	if !ok {
 		return nil, errors.New("missing block")
@@ -553,6 +599,207 @@ func TestSubmitNextBootstrapWaitsForHeadersOrR2Index(t *testing.T) {
 	}
 	if !result.WaitHeaders || !result.WaitR2Index || result.TargetHeight != 1 {
 		t.Fatalf("result = %+v, want wait for headers or R2 index at height 1", result)
+	}
+}
+
+func TestSubmitPipelinePrefetchesBlocksAndSubmitsInOrder(t *testing.T) {
+	var hashes []string
+	indexHashes := []string{fmt.Sprintf("%064x", 99)}
+	blocks := map[string][]byte{}
+	hashByHex := map[string]string{}
+	for i := uint32(1); i <= 4; i++ {
+		raw, hash := testRawBlock(t, i)
+		hashes = append(hashes, hash)
+		indexHashes = append(indexHashes, hash)
+		blocks[hash] = raw
+		hashByHex[hex.EncodeToString(raw)] = hash
+	}
+	bin, err := rangeindex.Encode(indexHashes, 5)
+	if err != nil {
+		t.Fatalf("Encode returned error: %v", err)
+	}
+
+	gate := make(chan struct{})
+	downloader := &fakeDownloader{
+		objects:   map[string][]byte{"index/range/v1/size-5/0000000000.bin": bin},
+		blocks:    blocks,
+		blockGate: gate,
+	}
+	rpc := &fakeSubmitRPC{
+		info:            btcrpc.BlockchainInfo{Blocks: 0, Headers: 0},
+		submitHashByHex: hashByHex,
+	}
+
+	done := make(chan struct {
+		result SubmitPipelineResult
+		err    error
+	}, 1)
+	go func() {
+		result, err := SubmitPipeline(context.Background(), rpc, downloader, SubmitConfig{
+			RangeSize:       5,
+			BootstrapFromR2: true,
+			DownloadWorkers: 4,
+			PrefetchWindow:  4,
+		})
+		done <- struct {
+			result SubmitPipelineResult
+			err    error
+		}{result: result, err: err}
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for active := 0; active < 2; {
+		downloader.mu.Lock()
+		active = downloader.activeBlocks
+		downloader.mu.Unlock()
+		select {
+		case <-deadline:
+			close(gate)
+			t.Fatalf("timed out waiting for concurrent prefetch, active=%d", active)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("SubmitPipeline returned error: %v", got.err)
+	}
+	if got.result.SubmittedBlocks != 4 || !got.result.WaitHeaders || !got.result.WaitR2Index || got.result.TargetHeight != 5 {
+		t.Fatalf("result = %+v, want 4 submitted blocks then wait for height 5 R2 index", got.result)
+	}
+	if downloader.maxActiveBlocks < 2 {
+		t.Fatalf("max concurrent block downloads = %d, want at least 2", downloader.maxActiveBlocks)
+	}
+	if len(rpc.submitHashes) != len(hashes) {
+		t.Fatalf("submit count = %d, want %d", len(rpc.submitHashes), len(hashes))
+	}
+	for i, want := range hashes {
+		if rpc.submitHashes[i] != want {
+			t.Fatalf("submit order = %v, want %v", rpc.submitHashes, hashes)
+		}
+	}
+}
+
+func TestSubmitPipelineWaitsForHeadersOrR2Index(t *testing.T) {
+	rpc := &fakeSubmitRPC{info: btcrpc.BlockchainInfo{Blocks: 0, Headers: 0}}
+	result, err := SubmitPipeline(context.Background(), rpc, &fakeDownloader{}, SubmitConfig{
+		RangeSize:       2,
+		BootstrapFromR2: true,
+	})
+	if err != nil {
+		t.Fatalf("SubmitPipeline returned error: %v", err)
+	}
+	if result.SubmittedBlocks != 0 || !result.WaitHeaders || !result.WaitR2Index || result.TargetHeight != 1 {
+		t.Fatalf("result = %+v, want wait for headers or R2 index at height 1", result)
+	}
+}
+
+func TestSubmitPipelineCachesMissingRangeIndexDuringHeaderFallback(t *testing.T) {
+	hashes := map[uint64]string{}
+	blocks := map[string][]byte{}
+	headers := map[string]btcrpc.BlockHeader{}
+	hashByHex := map[string]string{}
+	for height := uint64(1); height <= 3; height++ {
+		raw, hash := testRawBlock(t, uint32(height))
+		hashes[height] = hash
+		blocks[hash] = raw
+		hashByHex[hex.EncodeToString(raw)] = hash
+		header := btcrpc.BlockHeader{Hash: hash, Height: height}
+		if height > 1 {
+			header.PreviousBlockHash = hashes[height-1]
+		}
+		headers[hash] = header
+	}
+	rpc := &fakeSubmitRPC{
+		info:            btcrpc.BlockchainInfo{Blocks: 0, Headers: 3},
+		tips:            []btcrpc.ChainTip{{Height: 3, Hash: hashes[3], Status: "headers-only"}},
+		headers:         headers,
+		submitHashByHex: hashByHex,
+	}
+	downloader := &fakeDownloader{blocks: blocks}
+
+	result, err := SubmitPipeline(context.Background(), rpc, downloader, SubmitConfig{
+		RangeSize:       10,
+		RecentWalkLimit: 3,
+		DownloadWorkers: 1,
+		PrefetchWindow:  3,
+	})
+	if err != nil {
+		t.Fatalf("SubmitPipeline returned error: %v", err)
+	}
+	if result.SubmittedBlocks != 3 || result.TargetHeight != 4 || !result.WaitHeaders || result.WaitR2Index {
+		t.Fatalf("result = %+v, want 3 submitted blocks then wait for local headers", result)
+	}
+	if len(downloader.downloadedObjects) != 1 {
+		t.Fatalf("downloaded range indexes = %v, want one cached miss", downloader.downloadedObjects)
+	}
+	wantKey := "index/range/v1/size-10/0000000000.bin"
+	if downloader.downloadedObjects[0] != wantKey {
+		t.Fatalf("downloaded range index %q, want %q", downloader.downloadedObjects[0], wantKey)
+	}
+}
+
+func TestSubmitPipelineTreatsAcceptedHeightAsSubmittedAfterRPCError(t *testing.T) {
+	raw, hash := testRawBlock(t, 1)
+	bin, err := rangeindex.Encode([]string{fmt.Sprintf("%064x", 0), hash}, 2)
+	if err != nil {
+		t.Fatalf("Encode returned error: %v", err)
+	}
+	rpc := &fakeSubmitRPC{
+		infoSequence: []btcrpc.BlockchainInfo{
+			{Blocks: 0, Headers: 1},
+			{Blocks: 1, Headers: 1},
+		},
+		submitErr: errors.New("connection reset"),
+	}
+	downloader := &fakeDownloader{
+		objects: map[string][]byte{"index/range/v1/size-2/0000000000.bin": bin},
+		blocks:  map[string][]byte{hash: raw},
+	}
+
+	result, err := SubmitPipeline(context.Background(), rpc, downloader, SubmitConfig{
+		RangeSize:       2,
+		DownloadWorkers: 1,
+		PrefetchWindow:  1,
+	})
+	if err != nil {
+		t.Fatalf("SubmitPipeline returned error: %v", err)
+	}
+	if result.SubmittedBlocks != 1 || result.LastHeight != 1 || result.TargetHeight != 2 || !result.WaitHeaders {
+		t.Fatalf("result = %+v, want accepted submit then wait for height 2 headers", result)
+	}
+	if rpc.infoCalls != 2 {
+		t.Fatalf("GetBlockchainInfo calls = %d, want initial call plus submit error confirmation", rpc.infoCalls)
+	}
+}
+
+func TestSubmitPipelineReturnsRPCErrorWhenHeightNotAccepted(t *testing.T) {
+	raw, hash := testRawBlock(t, 1)
+	bin, err := rangeindex.Encode([]string{fmt.Sprintf("%064x", 0), hash}, 2)
+	if err != nil {
+		t.Fatalf("Encode returned error: %v", err)
+	}
+	rpc := &fakeSubmitRPC{
+		infoSequence: []btcrpc.BlockchainInfo{
+			{Blocks: 0, Headers: 1},
+			{Blocks: 0, Headers: 1},
+		},
+		submitErr: errors.New("rejected"),
+	}
+	downloader := &fakeDownloader{
+		objects: map[string][]byte{"index/range/v1/size-2/0000000000.bin": bin},
+		blocks:  map[string][]byte{hash: raw},
+	}
+
+	_, err = SubmitPipeline(context.Background(), rpc, downloader, SubmitConfig{
+		RangeSize:       2,
+		DownloadWorkers: 1,
+		PrefetchWindow:  1,
+	})
+	if err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("err = %v, want submit RPC error", err)
 	}
 }
 

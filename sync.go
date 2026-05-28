@@ -17,10 +17,12 @@ import (
 )
 
 const (
-	DefaultRangeSize       = rangeindex.DefaultRangeSize
-	DefaultStableDelay     = 2500
-	DefaultRecentWalkLimit = 2500
-	DefaultUploadWorkers   = 4
+	DefaultRangeSize             = rangeindex.DefaultRangeSize
+	DefaultStableDelay           = 2500
+	DefaultRecentWalkLimit       = 2500
+	DefaultUploadWorkers         = 4
+	DefaultSubmitDownloadWorkers = 4
+	DefaultSubmitPrefetchWindow  = 16
 )
 
 // BlockProvider is the bitcoind RPC subset required by UploadOnce.
@@ -297,6 +299,8 @@ type SubmitConfig struct {
 	RangeSize       uint64
 	RecentWalkLimit uint64
 	BootstrapFromR2 bool
+	DownloadWorkers uint
+	PrefetchWindow  uint
 	Logger          *log.Logger
 }
 
@@ -308,6 +312,15 @@ type SubmitResult struct {
 	WaitHeaders  bool
 	WaitR2Index  bool
 	RPCResult    string
+}
+
+// SubmitPipelineResult describes one pipelined submit run.
+type SubmitPipelineResult struct {
+	SubmittedBlocks uint64
+	LastHeight      uint64
+	TargetHeight    uint64
+	WaitHeaders     bool
+	WaitR2Index     bool
 }
 
 // SubmitNext downloads, verifies, and submits the next missing block.
@@ -372,6 +385,322 @@ func SubmitNext(ctx context.Context, rpc BlockSubmitter, downloader ObjectDownlo
 		cfg.Logger.Printf("submitted block height=%d hash=%s", target, result.Hash)
 	}
 	return result, nil
+}
+
+// SubmitPipeline prefetches and verifies future blocks in parallel while
+// submitting blocks to the node in height order.
+func SubmitPipeline(ctx context.Context, rpc BlockSubmitter, downloader ObjectDownloader, cfg SubmitConfig) (SubmitPipelineResult, error) {
+	rangeSize := cfg.RangeSize
+	if rangeSize == 0 {
+		rangeSize = DefaultRangeSize
+	}
+	recentWalkLimit := cfg.RecentWalkLimit
+	downloadWorkers := cfg.DownloadWorkers
+	if downloadWorkers == 0 {
+		downloadWorkers = DefaultSubmitDownloadWorkers
+	}
+	prefetchWindow := cfg.PrefetchWindow
+	if prefetchWindow == 0 {
+		prefetchWindow = DefaultSubmitPrefetchWindow
+	}
+
+	info, err := rpc.GetBlockchainInfo(ctx)
+	if err != nil {
+		return SubmitPipelineResult{}, fmt.Errorf("get blockchain info: %w", err)
+	}
+	target := info.Blocks + 1
+	pipeline := submitPipeline{
+		ctx:             ctx,
+		rpc:             rpc,
+		downloader:      downloader,
+		cfg:             cfg,
+		rangeSize:       rangeSize,
+		recentWalkLimit: recentWalkLimit,
+		headers:         info.Headers,
+		currentHeight:   target,
+		nextSchedule:    target,
+		prefetchWindow:  prefetchWindow,
+		downloadWorkers: downloadWorkers,
+		indexCache:      newSubmitRangeIndexCache(downloader, rangeSize),
+	}
+	return pipeline.run()
+}
+
+type submitPipeline struct {
+	ctx             context.Context
+	rpc             BlockSubmitter
+	downloader      ObjectDownloader
+	cfg             SubmitConfig
+	rangeSize       uint64
+	recentWalkLimit uint64
+	headers         uint64
+	currentHeight   uint64
+	nextSchedule    uint64
+	prefetchWindow  uint
+	downloadWorkers uint
+	indexCache      *submitRangeIndexCache
+
+	jobs    chan submitDownloadJob
+	results chan submitDownloadResult
+	ready   map[uint64]submitDownloadResult
+	pending map[uint64]struct{}
+
+	stoppedScheduling bool
+	waitHeaders       bool
+	waitR2Index       bool
+}
+
+type submitDownloadJob struct {
+	height uint64
+	hash   string
+}
+
+type submitDownloadResult struct {
+	height uint64
+	hash   string
+	raw    []byte
+	err    error
+}
+
+func (p *submitPipeline) run() (SubmitPipelineResult, error) {
+	downloadCtx, cancel := context.WithCancel(p.ctx)
+	defer cancel()
+
+	p.jobs = make(chan submitDownloadJob, int(p.prefetchWindow))
+	p.results = make(chan submitDownloadResult, int(p.prefetchWindow))
+	p.ready = map[uint64]submitDownloadResult{}
+	p.pending = map[uint64]struct{}{}
+
+	var workerWG sync.WaitGroup
+	for worker := uint(0); worker < p.downloadWorkers; worker++ {
+		workerWG.Add(1)
+		go func() {
+			defer workerWG.Done()
+			runSubmitDownloadWorker(downloadCtx, p.downloader, p.jobs, p.results)
+		}()
+	}
+	defer func() {
+		cancel()
+		close(p.jobs)
+		workerWG.Wait()
+	}()
+
+	result := SubmitPipelineResult{
+		TargetHeight: p.currentHeight,
+		LastHeight:   p.currentHeight - 1,
+	}
+	if err := p.fillWindow(); err != nil {
+		return result, err
+	}
+
+	for {
+		if ready, ok := p.ready[p.currentHeight]; ok {
+			delete(p.ready, p.currentHeight)
+			if ready.err != nil {
+				return result, ready.err
+			}
+			rpcResult, err := p.rpc.SubmitBlock(p.ctx, hex.EncodeToString(ready.raw))
+			if err != nil {
+				if !submittedHeightAccepted(p.ctx, p.rpc, ready.height) {
+					return result, fmt.Errorf("submit block %s at height %d: %w", ready.hash, ready.height, err)
+				}
+				if p.cfg.Logger != nil {
+					p.cfg.Logger.Printf("submit block returned error but height is accepted height=%d hash=%s err=%v", ready.height, ready.hash, err)
+				}
+			}
+			if err == nil {
+				submitted := rpcResult == "" || isAlreadyKnownSubmitResult(rpcResult)
+				if !submitted {
+					return result, fmt.Errorf("submit block %s at height %d returned %q", ready.hash, ready.height, rpcResult)
+				}
+			}
+			result.SubmittedBlocks++
+			result.LastHeight = ready.height
+			result.TargetHeight = ready.height + 1
+			if p.cfg.Logger != nil {
+				p.cfg.Logger.Printf("submitted block height=%d hash=%s", ready.height, ready.hash)
+			}
+			if p.currentHeight == ^uint64(0) {
+				return result, nil
+			}
+			p.currentHeight++
+			if err := p.fillWindow(); err != nil {
+				return result, err
+			}
+			continue
+		}
+
+		if _, ok := p.pending[p.currentHeight]; !ok && p.stoppedScheduling {
+			result.TargetHeight = p.currentHeight
+			result.WaitHeaders = p.waitHeaders
+			result.WaitR2Index = p.waitR2Index
+			if result.WaitHeaders {
+				return result, nil
+			}
+			return result, nil
+		}
+
+		select {
+		case <-p.ctx.Done():
+			return result, p.ctx.Err()
+		case downloaded := <-p.results:
+			delete(p.pending, downloaded.height)
+			p.ready[downloaded.height] = downloaded
+		}
+	}
+}
+
+func (p *submitPipeline) fillWindow() error {
+	for !p.stoppedScheduling && uint(len(p.ready)+len(p.pending)) < p.prefetchWindow {
+		hash, waitHeaders, waitR2Index, err := p.resolveHash(p.nextSchedule)
+		if err != nil {
+			return err
+		}
+		if waitHeaders {
+			p.stoppedScheduling = true
+			p.waitHeaders = true
+			p.waitR2Index = waitR2Index
+			return nil
+		}
+
+		job := submitDownloadJob{height: p.nextSchedule, hash: hash}
+		select {
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		case p.jobs <- job:
+			p.pending[p.nextSchedule] = struct{}{}
+		}
+		if p.nextSchedule == ^uint64(0) {
+			p.stoppedScheduling = true
+			return nil
+		}
+		p.nextSchedule++
+	}
+	return nil
+}
+
+func (p *submitPipeline) resolveHash(height uint64) (string, bool, bool, error) {
+	if height > p.headers {
+		if !p.cfg.BootstrapFromR2 {
+			return "", true, false, nil
+		}
+		hash, err := p.indexCache.hashAt(p.ctx, height)
+		if err != nil {
+			if errors.Is(err, r2store.ErrNotFound) {
+				return "", true, true, nil
+			}
+			return "", false, false, err
+		}
+		return hash, false, false, nil
+	}
+
+	hash, err := p.indexCache.hashAt(p.ctx, height)
+	if err == nil {
+		return hash, false, false, nil
+	}
+	if !errors.Is(err, r2store.ErrNotFound) {
+		return "", false, false, err
+	}
+	hash, err = resolveRecentHash(p.ctx, p.rpc, height, p.recentWalkLimit)
+	if err != nil {
+		return "", false, false, err
+	}
+	return hash, false, false, nil
+}
+
+func runSubmitDownloadWorker(ctx context.Context, downloader ObjectDownloader, jobs <-chan submitDownloadJob, results chan<- submitDownloadResult) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job, ok := <-jobs:
+			if !ok {
+				return
+			}
+			result := downloadAndVerifySubmitBlock(ctx, downloader, job)
+			select {
+			case <-ctx.Done():
+				return
+			case results <- result:
+			}
+		}
+	}
+}
+
+func downloadAndVerifySubmitBlock(ctx context.Context, downloader ObjectDownloader, job submitDownloadJob) submitDownloadResult {
+	raw, err := downloader.DownloadBlock(ctx, job.hash)
+	if err != nil {
+		return submitDownloadResult{
+			height: job.height,
+			hash:   job.hash,
+			err:    fmt.Errorf("download block %s at height %d: %w", job.hash, job.height, err),
+		}
+	}
+	gotHash, err := blockhash.FromRawBlock(raw)
+	if err != nil {
+		return submitDownloadResult{
+			height: job.height,
+			hash:   job.hash,
+			err:    fmt.Errorf("calculate block hash at height %d: %w", job.height, err),
+		}
+	}
+	if gotHash != job.hash {
+		return submitDownloadResult{
+			height: job.height,
+			hash:   job.hash,
+			err:    fmt.Errorf("downloaded block hash mismatch at height %d: got %s, want %s", job.height, gotHash, job.hash),
+		}
+	}
+	return submitDownloadResult{
+		height: job.height,
+		hash:   job.hash,
+		raw:    raw,
+	}
+}
+
+type submitRangeIndexCache struct {
+	downloader ObjectDownloader
+	rangeSize  uint64
+	key        string
+	start      uint64
+	bin        []byte
+	missing    map[string]struct{}
+}
+
+func newSubmitRangeIndexCache(downloader ObjectDownloader, rangeSize uint64) *submitRangeIndexCache {
+	return &submitRangeIndexCache{
+		downloader: downloader,
+		rangeSize:  rangeSize,
+		missing:    map[string]struct{}{},
+	}
+}
+
+func (c *submitRangeIndexCache) hashAt(ctx context.Context, height uint64) (string, error) {
+	key, startHeight, err := rangeindex.ObjectKeyForHeight(height, c.rangeSize)
+	if err != nil {
+		return "", err
+	}
+	if _, ok := c.missing[key]; ok {
+		return "", r2store.ErrNotFound
+	}
+	if c.key != key {
+		bin, err := c.downloader.DownloadObject(ctx, key)
+		if errors.Is(err, r2store.ErrNotFound) {
+			c.missing[key] = struct{}{}
+			return "", err
+		}
+		if err != nil {
+			return "", fmt.Errorf("download range index %s: %w", key, err)
+		}
+		c.key = key
+		c.start = startHeight
+		c.bin = bin
+	}
+	hash, err := rangeindex.HashAt(c.bin, c.start, height, c.rangeSize)
+	if err != nil {
+		return "", fmt.Errorf("read range index %s: %w", c.key, err)
+	}
+	return hash, nil
 }
 
 func resolveTargetHash(ctx context.Context, rpc BlockSubmitter, downloader ObjectDownloader, target uint64, rangeSize uint64, recentWalkLimit uint64) (string, error) {
@@ -471,6 +800,14 @@ func isAlreadyKnownSubmitResult(result string) bool {
 	return strings.Contains(result, "duplicate") ||
 		strings.Contains(result, "already") ||
 		strings.Contains(result, "known")
+}
+
+func submittedHeightAccepted(ctx context.Context, rpc BlockSubmitter, height uint64) bool {
+	info, err := rpc.GetBlockchainInfo(ctx)
+	if err != nil {
+		return false
+	}
+	return info.Blocks >= height
 }
 
 // SleepOrDone sleeps unless ctx is canceled. It is used by follow loops.

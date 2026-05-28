@@ -77,6 +77,9 @@ services:
       BITCOIN_COOKIE_FILE: ${BITCOIN_COOKIE_FILE:-}
       RECENT_WALK_LIMIT: ${RECENT_WALK_LIMIT:-2500}
       BOOTSTRAP_FROM_R2: ${BOOTSTRAP_FROM_R2:-false}
+      SUBMIT_DOWNLOAD_WORKERS: ${SUBMIT_DOWNLOAD_WORKERS:-4}
+      SUBMIT_PREFETCH_WINDOW: ${SUBMIT_PREFETCH_WINDOW:-16}
+      DOWNLOAD_TIMEOUT: ${DOWNLOAD_TIMEOUT:-2m}
       SUBMIT_INTERVAL: ${SUBMIT_INTERVAL:-10s}
     entrypoint:
       - /bin/sh
@@ -87,6 +90,9 @@ services:
           --base-url "$${BASE_URL}" \
           --rpc-url "$${RPC_URL}" \
           --recent-walk-limit "$${RECENT_WALK_LIMIT}" \
+          --submit-download-workers "$${SUBMIT_DOWNLOAD_WORKERS}" \
+          --submit-prefetch-window "$${SUBMIT_PREFETCH_WINDOW}" \
+          --download-timeout "$${DOWNLOAD_TIMEOUT}" \
           --interval "$${SUBMIT_INTERVAL}" \
           --follow
         if [ "$${BOOTSTRAP_FROM_R2:-false}" = "true" ]; then

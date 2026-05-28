@@ -128,6 +128,9 @@ func runSubmit(ctx context.Context, args []string) error {
 	rpcPassword := flags.String("rpc-password", "", "bitcoind RPC password")
 	recentWalkLimit := flags.Uint64("recent-walk-limit", blocksync.DefaultRecentWalkLimit, "maximum recent header walk")
 	bootstrapFromR2 := flags.Bool("bootstrap-from-r2", false, "submit using R2 range indexes when local headers are unavailable")
+	submitDownloadWorkers := flags.Uint("submit-download-workers", blocksync.DefaultSubmitDownloadWorkers, "parallel submit block download workers in follow mode")
+	submitPrefetchWindow := flags.Uint("submit-prefetch-window", blocksync.DefaultSubmitPrefetchWindow, "maximum prefetched submit blocks in follow mode")
+	downloadTimeout := flags.Duration("download-timeout", 2*time.Minute, "public R2 download timeout")
 	follow := flags.Bool("follow", false, "keep submitting as headers arrive")
 	interval := flags.Duration("interval", 10*time.Second, "follow polling interval")
 	if err := flags.Parse(args); err != nil {
@@ -138,7 +141,7 @@ func runSubmit(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	downloader, err := r2store.NewPublicClient(*baseURL, nil)
+	downloader, err := r2store.NewPublicClient(*baseURL, newDownloadHTTPClient(*submitDownloadWorkers, *downloadTimeout))
 	if err != nil {
 		return err
 	}
@@ -147,7 +150,36 @@ func runSubmit(ctx context.Context, args []string) error {
 	cfg := blocksync.SubmitConfig{
 		RecentWalkLimit: *recentWalkLimit,
 		BootstrapFromR2: *bootstrapFromR2,
+		DownloadWorkers: *submitDownloadWorkers,
+		PrefetchWindow:  *submitPrefetchWindow,
 		Logger:          logger,
+	}
+	if *follow {
+		for {
+			result, err := blocksync.SubmitPipeline(ctx, rpcClient, downloader, cfg)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
+				}
+				return err
+			}
+			if result.WaitHeaders {
+				if result.WaitR2Index {
+					logger.Printf("waiting for local headers or R2 range index target_height=%d", result.TargetHeight)
+				} else {
+					logger.Printf("waiting for local headers target_height=%d", result.TargetHeight)
+				}
+				if err := blocksync.SleepOrDone(ctx, *interval); err != nil {
+					return nil
+				}
+				continue
+			}
+			if result.SubmittedBlocks == 0 {
+				if err := blocksync.SleepOrDone(ctx, *interval); err != nil {
+					return nil
+				}
+			}
+		}
 	}
 	for {
 		result, err := blocksync.SubmitNext(ctx, rpcClient, downloader, cfg)
@@ -200,7 +232,7 @@ func runBenchDownload(ctx context.Context, args []string) error {
 		toHeight = &parsed
 	}
 
-	downloader, err := r2store.NewPublicClient(*baseURL, newBenchHTTPClient(*workers))
+	downloader, err := r2store.NewPublicClient(*baseURL, newDownloadHTTPClient(*workers, 0))
 	if err != nil {
 		return err
 	}
@@ -229,18 +261,21 @@ func runBenchDownload(ctx context.Context, args []string) error {
 	return err
 }
 
-func newBenchHTTPClient(workers uint) *http.Client {
+func newDownloadHTTPClient(workers uint, timeout time.Duration) *http.Client {
 	idleConns := int(workers) * 2
 	if idleConns < int(blocksync.DefaultBenchDownloadWorkers) {
 		idleConns = int(blocksync.DefaultBenchDownloadWorkers)
 	}
 	return &http.Client{
+		Timeout: timeout,
 		Transport: &http.Transport{
-			Proxy:               http.ProxyFromEnvironment,
-			MaxIdleConns:        idleConns,
-			MaxIdleConnsPerHost: idleConns,
-			IdleConnTimeout:     90 * time.Second,
-			TLSHandshakeTimeout: 10 * time.Second,
+			Proxy:                 http.ProxyFromEnvironment,
+			MaxIdleConns:          idleConns,
+			MaxIdleConnsPerHost:   idleConns,
+			ForceAttemptHTTP2:     true,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
 		},
 	}
 }
