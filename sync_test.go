@@ -74,10 +74,13 @@ func (f *fakeUploadRPC) GetBlockRawHex(ctx context.Context, hash string) (string
 }
 
 type fakeWriter struct {
-	mu     sync.Mutex
-	blocks map[string][]byte
-	index  map[string][]byte
-	events []string
+	mu             sync.Mutex
+	blocks         map[string][]byte
+	index          map[string][]byte
+	events         []string
+	blockHeadGate  chan struct{}
+	activeHeads    int
+	maxActiveHeads int
 }
 
 func (f *fakeWriter) UploadBlock(ctx context.Context, hash string, data []byte) error {
@@ -93,9 +96,29 @@ func (f *fakeWriter) UploadBlock(ctx context.Context, hash string, data []byte) 
 
 func (f *fakeWriter) BlockExists(ctx context.Context, hash string) (bool, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	_, ok := f.blocks[hash]
 	f.events = append(f.events, "head-block:"+hash)
+	gate := f.blockHeadGate
+	if gate != nil {
+		f.activeHeads++
+		if f.activeHeads > f.maxActiveHeads {
+			f.maxActiveHeads = f.activeHeads
+		}
+	}
+	f.mu.Unlock()
+
+	if gate != nil {
+		defer func() {
+			f.mu.Lock()
+			f.activeHeads--
+			f.mu.Unlock()
+		}()
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-gate:
+		}
+	}
 	return ok, nil
 }
 
@@ -296,6 +319,101 @@ func TestUploadOnceSkipsExistingBlocksInMissingRange(t *testing.T) {
 	}
 	if _, ok := writer.blocks[hashes[2]]; !ok {
 		t.Fatal("did not upload missing last block")
+	}
+}
+
+func TestUploadOnceProbesMissingRangeBeforePerBlockUpload(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 300)
+	rpc := &fakeUploadRPC{tip: 299, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{blocks: map[string][]byte{}}
+	for height := uint64(0); height < 200; height++ {
+		writer.blocks[hashes[height]] = []byte{byte(height)}
+	}
+
+	err := UploadOnce(context.Background(), rpc, writer, UploadConfig{RangeSize: 300, StableDelay: 0, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("UploadOnce returned error: %v", err)
+	}
+	if countEvents(writer.events, "head-block:"+hashes[50]) != 0 {
+		t.Fatalf("checked height 50 before first missing probe: events = %v", writer.events)
+	}
+	if countEvents(writer.events, "head-block:"+hashes[100]) == 0 {
+		t.Fatalf("did not recheck previous probe window: events = %v", writer.events)
+	}
+	if countEvents(writer.events, "block:"+hashes[150]) != 0 {
+		t.Fatal("uploaded existing block in previous probe window")
+	}
+	if _, ok := writer.blocks[hashes[200]]; !ok {
+		t.Fatal("did not upload first missing probe block")
+	}
+	if _, ok := writer.index["index/range/v1/size-300/0000000000.bin"]; !ok {
+		t.Fatal("did not publish complete range index")
+	}
+}
+
+func TestUploadOnceChecksFinalWindowWhenAllProbesExist(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 300)
+	rpc := &fakeUploadRPC{tip: 299, hashes: hashes, blocks: blocks}
+	writer := &fakeWriter{blocks: map[string][]byte{}}
+	for height := uint64(0); height < 250; height++ {
+		writer.blocks[hashes[height]] = []byte{byte(height)}
+	}
+
+	err := UploadOnce(context.Background(), rpc, writer, UploadConfig{RangeSize: 300, StableDelay: 0, UploadWorkers: 1})
+	if err != nil {
+		t.Fatalf("UploadOnce returned error: %v", err)
+	}
+	if countEvents(writer.events, "head-block:"+hashes[150]) != 0 {
+		t.Fatalf("checked height 150 outside final probe window: events = %v", writer.events)
+	}
+	if countEvents(writer.events, "head-block:"+hashes[200]) == 0 {
+		t.Fatalf("did not check final probe window: events = %v", writer.events)
+	}
+	if _, ok := writer.blocks[hashes[250]]; !ok {
+		t.Fatal("did not upload missing tail block")
+	}
+	if _, ok := writer.index["index/range/v1/size-300/0000000000.bin"]; !ok {
+		t.Fatal("did not publish complete range index")
+	}
+}
+
+func TestUploadOnceRunsMissingRangeProbesInParallel(t *testing.T) {
+	hashes, blocks := makeUploadFixture(t, 300)
+	rpc := &fakeUploadRPC{tip: 299, hashes: hashes, blocks: blocks}
+	gate := make(chan struct{})
+	writer := &fakeWriter{
+		blocks:        map[string][]byte{},
+		blockHeadGate: gate,
+	}
+	for height := uint64(0); height < 300; height += 100 {
+		writer.blocks[hashes[height]] = []byte{byte(height)}
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- UploadOnce(context.Background(), rpc, writer, UploadConfig{RangeSize: 300, StableDelay: 0, UploadWorkers: 4})
+	}()
+
+	deadline := time.After(2 * time.Second)
+	for active := 0; active < 2; {
+		writer.mu.Lock()
+		active = writer.activeHeads
+		writer.mu.Unlock()
+		select {
+		case <-deadline:
+			close(gate)
+			t.Fatalf("timed out waiting for concurrent probe heads, active=%d", active)
+		default:
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(gate)
+
+	if err := <-done; err != nil {
+		t.Fatalf("UploadOnce returned error: %v", err)
+	}
+	if writer.maxActiveHeads < 2 {
+		t.Fatalf("max concurrent block heads = %d, want at least 2", writer.maxActiveHeads)
 	}
 }
 

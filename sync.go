@@ -23,6 +23,7 @@ const (
 	DefaultUploadWorkers         = 4
 	DefaultSubmitDownloadWorkers = 4
 	DefaultSubmitPrefetchWindow  = 16
+	uploadMissingProbeStep       = 100
 )
 
 // BlockProvider is the bitcoind RPC subset required by UploadOnce.
@@ -185,6 +186,138 @@ func uploadBlocks(ctx context.Context, rpc BlockProvider, writer ObjectWriter, f
 	if fromHeight > tip {
 		return nil
 	}
+	uploadStart, err := findUploadStart(ctx, rpc, writer, fromHeight, tip, uploadMissingProbeStep, workers, logger)
+	if err != nil {
+		return err
+	}
+	return uploadBlocksFrom(ctx, rpc, writer, uploadStart, tip, workers, logger)
+}
+
+func findUploadStart(ctx context.Context, rpc BlockProvider, writer ObjectWriter, fromHeight uint64, tip uint64, probeStep uint64, workers uint, logger *log.Logger) (uint64, error) {
+	if probeStep == 0 {
+		return fromHeight, nil
+	}
+	probes := uploadProbeHeights(fromHeight, tip, probeStep)
+	results, err := checkUploadProbes(ctx, rpc, writer, probes, workers, logger)
+	if err != nil {
+		return 0, err
+	}
+	for _, result := range results {
+		if !result.exists {
+			start := previousUploadWindowStart(fromHeight, result.height, probeStep)
+			if logger != nil {
+				logger.Printf("found missing block probe height=%d upload_start=%d", result.height, start)
+			}
+			return start, nil
+		}
+	}
+	start := finalUploadWindowStart(fromHeight, tip, probeStep)
+	if logger != nil {
+		logger.Printf("no missing block probe found from=%d to=%d upload_start=%d", fromHeight, tip, start)
+	}
+	return start, nil
+}
+
+func uploadProbeHeights(fromHeight uint64, tip uint64, probeStep uint64) []uint64 {
+	var probes []uint64
+	for height := fromHeight; ; {
+		probes = append(probes, height)
+		if tip-height < probeStep {
+			break
+		}
+		height += probeStep
+	}
+	return probes
+}
+
+type uploadProbeResult struct {
+	index   int
+	height  uint64
+	hash    string
+	exists  bool
+	elapsed time.Duration
+	err     error
+}
+
+func checkUploadProbes(ctx context.Context, rpc BlockProvider, writer ObjectWriter, probes []uint64, workers uint, logger *log.Logger) ([]uploadProbeResult, error) {
+	if len(probes) == 0 {
+		return nil, nil
+	}
+	workerCount := int(workers)
+	if workerCount < 1 {
+		workerCount = 1
+	}
+	if workerCount > len(probes) {
+		workerCount = len(probes)
+	}
+
+	jobs := make(chan int, len(probes))
+	results := make(chan uploadProbeResult, len(probes))
+	for index := range probes {
+		jobs <- index
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	for worker := 0; worker < workerCount; worker++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				height := probes[index]
+				start := time.Now()
+				hash, exists, err := getUploadBlockState(ctx, rpc, writer, height)
+				result := uploadProbeResult{
+					index:   index,
+					height:  height,
+					hash:    hash,
+					exists:  exists,
+					elapsed: time.Since(start),
+					err:     err,
+				}
+				if logger != nil {
+					if err != nil {
+						logger.Printf("check block probe failed height=%d elapsed=%s err=%v", height, result.elapsed, err)
+					} else {
+						logger.Printf("checked block probe height=%d hash=%s exists=%t elapsed=%s", height, hash, exists, result.elapsed)
+					}
+				}
+				results <- result
+			}
+		}()
+	}
+	wg.Wait()
+	close(results)
+
+	ordered := make([]uploadProbeResult, len(probes))
+	var firstErr error
+	for result := range results {
+		ordered[result.index] = result
+		if result.err != nil && firstErr == nil {
+			firstErr = result.err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return ordered, nil
+}
+
+func previousUploadWindowStart(fromHeight uint64, missingHeight uint64, probeStep uint64) uint64 {
+	if missingHeight-fromHeight <= probeStep {
+		return fromHeight
+	}
+	return missingHeight - probeStep
+}
+
+func finalUploadWindowStart(fromHeight uint64, tip uint64, window uint64) uint64 {
+	if tip-fromHeight < window {
+		return fromHeight
+	}
+	return tip - window + 1
+}
+
+func uploadBlocksFrom(ctx context.Context, rpc BlockProvider, writer ObjectWriter, fromHeight uint64, tip uint64, workers uint, logger *log.Logger) error {
 	if workers <= 1 {
 		for height := fromHeight; ; height++ {
 			if err := uploadBlock(ctx, rpc, writer, height, logger); err != nil {
@@ -249,13 +382,9 @@ func uploadBlocks(ctx context.Context, rpc BlockProvider, writer ObjectWriter, f
 }
 
 func uploadBlock(ctx context.Context, rpc BlockProvider, writer ObjectWriter, height uint64, logger *log.Logger) error {
-	hash, err := rpc.GetBlockHash(ctx, height)
+	hash, exists, err := getUploadBlockState(ctx, rpc, writer, height)
 	if err != nil {
-		return fmt.Errorf("get block hash at height %d: %w", height, err)
-	}
-	exists, err := writer.BlockExists(ctx, hash)
-	if err != nil {
-		return fmt.Errorf("check block %s at height %d: %w", hash, height, err)
+		return err
 	}
 	if exists {
 		if logger != nil {
@@ -278,6 +407,18 @@ func uploadBlock(ctx context.Context, rpc BlockProvider, writer ObjectWriter, he
 		logger.Printf("uploaded block height=%d hash=%s", height, hash)
 	}
 	return nil
+}
+
+func getUploadBlockState(ctx context.Context, rpc BlockProvider, writer ObjectWriter, height uint64) (string, bool, error) {
+	hash, err := rpc.GetBlockHash(ctx, height)
+	if err != nil {
+		return "", false, fmt.Errorf("get block hash at height %d: %w", height, err)
+	}
+	exists, err := writer.BlockExists(ctx, hash)
+	if err != nil {
+		return "", false, fmt.Errorf("check block %s at height %d: %w", hash, height, err)
+	}
+	return hash, exists, nil
 }
 
 // BlockSubmitter is the bitcoind RPC subset required by SubmitNext.
